@@ -10,6 +10,28 @@ from include.util.address import get_client_ip
 def global_process_request(
     connection: ServerConnection, request: Request
 ) -> Response | None:
+    connection_header = request.headers.get("Connection", "")
+    upgrade_header = request.headers.get("Upgrade", "")
+    connection_tokens = {
+        token.strip().lower()
+        for token in connection_header.split(",")
+        if token.strip()
+    }
+
+    # Reject plain HTTP requests before websocket protocol validation.
+    if "upgrade" not in connection_tokens or upgrade_header.lower() != "websocket":
+        response_headers = Headers()
+        response_headers["Content-Type"] = "text/plain"
+        return Response(
+            status_code=HTTPStatus.UPGRADE_REQUIRED,
+            reason_phrase="Upgrade Required",
+            headers=response_headers,
+            body=(
+                b"This endpoint only accepts WebSocket connections. "
+                b"Use wss:// and send Upgrade: websocket headers."
+            ),
+        )
+
     ip = get_client_ip(connection)
 
     # IP-only check
