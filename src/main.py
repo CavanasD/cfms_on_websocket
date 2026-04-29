@@ -94,15 +94,17 @@ def server_init():
     Initializes the server by checking if the database is already set up.
     If not, it creates the necessary tables and a default admin user.
     """
-    if os.path.exists(ROOT_ABSPATH / "app.db"):
+    if (
+        os.path.exists(ROOT_ABSPATH / "app.db")
+        and global_config["database"]["type"] == "sqlite"
+    ):
         os.remove(ROOT_ABSPATH / "app.db")
-    if os.path.exists(ROOT_ABSPATH / "ssl_cert.pem"):
-        os.remove(ROOT_ABSPATH / "ssl_cert.pem")
-    if os.path.exists(ROOT_ABSPATH / "ssl_key.pem"):
-        os.remove(ROOT_ABSPATH / "ssl_key.pem")
 
     # Create database tables before inserting data
     Base.metadata.create_all(engine)
+
+    # Ensure the root folder exists before seeding any objects that reference it.
+    ensure_root_folder()
 
     from include.util.group import create_group
 
@@ -273,8 +275,6 @@ def server_init():
 
     with open(ROOT_ABSPATH / "init", "w") as f:
         f.write("This file indicates that the database has been initialized.\n")
-
-    ensure_root_folder()
 
 
 def prepare_handlers():
