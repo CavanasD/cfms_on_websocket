@@ -2,12 +2,88 @@ import time
 
 from argon2 import PasswordHasher
 
+from include.constants import HOME_PARENT_DIRECTORY_ID
 from include.database.handler import Session
-from include.database.models.classic import User, UserMembership, UserPermission
+from include.database.models.classic import (
+    ObjectAccessEntry,
+    User,
+    UserMembership,
+    UserPermission,
+)
+from include.database.models.entity import Folder
+from include.util.rule.applying import set_access_rules
 
 # Module-level PasswordHasher instance — reused across all calls to avoid
 # repeated construction overhead.
 _password_hasher = PasswordHasher()
+
+
+# Access rule that denies non-sysop users via the rule path. Owners get access
+# through ObjectAccessEntry grants which short-circuit before rules are evaluated.
+_SYSOP_ONLY_RULE = {
+    "match": "all",
+    "match_groups": [
+        {
+            "match": "all",
+            "groups": {"match": "all", "require": ["sysop"]},
+        }
+    ],
+}
+_SYSOP_ONLY_RULES = {
+    "read": [_SYSOP_ONLY_RULE],
+    "write": [_SYSOP_ONLY_RULE],
+    "manage": [_SYSOP_ONLY_RULE],
+}
+
+
+def ensure_user_home(username: str) -> str:
+    """
+    Ensure the given user has a personal home directory under ``/home``.
+
+    Creates ``/home/<username>`` (if missing), wires read/write/manage grants
+    to that user via ObjectAccessEntry, and stores the folder id on
+    ``User.home_directory_id``. Sets ``inherit=False`` on the home folder so
+    access checks do not bubble up into ``/home`` (which is sysop-only).
+
+    Returns the folder id.
+    """
+    with Session() as session:
+        user = session.get(User, username)
+        if user is None:
+            raise ValueError(f"User not found: {username}")
+
+        if user.home_directory_id:
+            existing = session.get(Folder, user.home_directory_id)
+            if existing is not None:
+                return existing.id
+
+        home_folder = Folder(
+            name=username,
+            parent_id=HOME_PARENT_DIRECTORY_ID,
+            inherit=False,
+        )
+        session.add(home_folder)
+        session.flush()  # populate generated id
+
+        set_access_rules(home_folder, _SYSOP_ONLY_RULES, inherit_parent=False)
+
+        now = time.time()
+        for access_type in ("read", "write", "manage"):
+            session.add(
+                ObjectAccessEntry(
+                    entity_type="user",
+                    entity_identifier=username,
+                    target_type="directory",
+                    target_identifier=home_folder.id,
+                    access_type=access_type,
+                    start_time=now,
+                    end_time=None,
+                )
+            )
+
+        user.home_directory_id = home_folder.id
+        session.commit()
+        return home_folder.id
 
 
 def create_user(**kwargs) -> None:

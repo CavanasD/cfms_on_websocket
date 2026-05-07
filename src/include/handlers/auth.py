@@ -20,7 +20,7 @@ from include.util.pwd import (
     MissingComponentsError,
     check_passwd_requirements,
 )
-from include.util.user import create_user
+from include.util.user import create_user, ensure_user_home
 
 
 class RequestLoginHandler(RequestHandler):
@@ -109,6 +109,7 @@ class RequestLoginHandler(RequestHandler):
                 "avatar_id": user.avatar_id,
                 "permissions": list(user.all_permissions),
                 "groups": list(user.all_groups),
+                "home_directory_id": user.home_directory_id,
             }
 
             if user.preference_dek_id:
@@ -233,6 +234,8 @@ class RequestRegisterHandler(RequestHandler):
             permissions=[],
             groups=[{"group_name": "user", "start_time": 0, "end_time": None}],
         )
+
+        ensure_user_home(username)
 
         handler.conclude_request(200, {}, "User registered successfully")
         return 0, username

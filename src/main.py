@@ -34,6 +34,7 @@ from include.conf_loader import global_config
 from include.constants import (
     CORE_VERSION,
     DEFAULT_SSL_CERT_VALIDITY_DAYS,
+    HOME_PARENT_DIRECTORY_ID,
     ROOT_ABSPATH,
     ROOT_DIRECTORY_ID,
 )
@@ -88,6 +89,22 @@ def ensure_root_folder():
             set_access_rules(root, _DEFAULT_ROOT_ACCESS_RULES, inherit_parent=False)
             session.commit()
 
+        # /home is the per-user home directory parent. Listed only by sysop;
+        # regular users access their own home via User.home_directory_id and
+        # the explicit ObjectAccessEntry granted at registration time.
+        if not session.get(Folder, HOME_PARENT_DIRECTORY_ID):
+            home_parent = Folder(
+                id=HOME_PARENT_DIRECTORY_ID,
+                name="home",
+                parent_id=ROOT_DIRECTORY_ID,
+                inherit=False,
+            )
+            session.add(home_parent)
+            set_access_rules(
+                home_parent, _DEFAULT_ROOT_ACCESS_RULES, inherit_parent=False
+            )
+            session.commit()
+
 
 def server_init():
     """
@@ -108,10 +125,33 @@ def server_init():
 
     from include.util.group import create_group
 
+    # Default cloud-drive end-user group. Members own a personal /home/<username>
+    # folder (created at registration). Operations are gated by ACL on the home
+    # folder, so these "verb" permissions only apply where the user has access.
     create_group(
         group_name="user",
         permissions=[
             {"permission": Permissions.SET_PASSWD},
+            {"permission": Permissions.CREATE_DOCUMENT},
+            {"permission": Permissions.CREATE_DIRECTORY},
+            {"permission": Permissions.DELETE_DOCUMENT},
+            {"permission": Permissions.DELETE_DIRECTORY},
+            {"permission": Permissions.RENAME_DOCUMENT},
+            {"permission": Permissions.RENAME_DIRECTORY},
+            {"permission": Permissions.MOVE},
+            {"permission": Permissions.RESTORE},
+            {"permission": Permissions.PURGE},
+            {"permission": Permissions.LIST_DELETED_ITEMS},
+            {"permission": Permissions.LIST_REVISIONS},
+            {"permission": Permissions.VIEW_REVISION},
+            {"permission": Permissions.SET_CURRENT_REVISION},
+            {"permission": Permissions.DELETE_REVISION},
+            {"permission": Permissions.MANAGE_KEYRINGS},
+            {"permission": Permissions.MANAGE_2FA},
+            {"permission": Permissions.GET_USER_INFO},
+            {"permission": Permissions.SET_ACCESS_RULES},
+            {"permission": Permissions.VIEW_ACCESS_RULES},
+            {"permission": Permissions.MANAGE_ACCESS},
         ],
     )
     create_group(
@@ -190,6 +230,8 @@ def server_init():
     alphabet = string.ascii_letters + string.digits + "!@#$%^&*()-_=+[]{};:,.<>?/"
     password = "".join(secrets.choice(alphabet) for _ in range(16))
 
+    # Admin is a defender/management role only — NOT a cloud-drive end-user.
+    # No "user" group membership, no /home/admin folder.
     create_user(
         username="admin",
         password=password,
@@ -198,11 +240,6 @@ def server_init():
         groups=[
             {
                 "group_name": "sysop",
-                "start_time": 0,
-                "end_time": None,
-            },
-            {
-                "group_name": "user",
                 "start_time": 0,
                 "end_time": None,
             },

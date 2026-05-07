@@ -12,6 +12,7 @@ __all__ = [
     "REPLAY_PROTECTION_TIME_WINDOW_SECONDS",
     "NONCE_MIN_LENGTH",
     "ROOT_DIRECTORY_ID",
+    "HOME_PARENT_DIRECTORY_ID",
     "MAX_PARAM_SIZE",
     "QUERY_CHUNK_SIZE",
     "TRUSTED_PROXY_IPS",
@@ -46,6 +47,11 @@ NONCE_MIN_LENGTH = 16  # Minimum length of a nonce string
 
 # Root directory virtual folder ID — used to store access rules for the root directory
 ROOT_DIRECTORY_ID = "/"
+
+# Parent folder under which every user's personal home directory is created.
+# Each user's home folder is created at runtime as a child of this folder
+# with a deterministic name equal to their username.
+HOME_PARENT_DIRECTORY_ID = "/home"
 
 # Database Constants
 MAX_PARAM_SIZE = 950  # Maximum number of parameters in a single SQL query

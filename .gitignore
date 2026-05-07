@@ -1,3 +1,12 @@
+# Runtime-stored data (uploaded blobs, sqlite db, init markers)
+content/files/
+src/content/files/
+src/content/logs/
+**/app.db
+**/app.db-journal
+src/init
+src/admin_password.txt
+
 # Python
 __pycache__/
 *.py[cod]

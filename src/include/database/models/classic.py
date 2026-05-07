@@ -114,6 +114,12 @@ class User(Base):
         foreign_keys=[preference_dek_id],
     )
 
+    home_directory_id: Mapped[Optional[str]] = mapped_column(
+        VARCHAR(255),
+        ForeignKey("folders.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+
     def __repr__(self) -> str:
         return (
             f"User(username={self.username!r}, "
