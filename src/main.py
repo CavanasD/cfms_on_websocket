@@ -39,8 +39,7 @@ from include.constants import (
     ROOT_DIRECTORY_ID,
 )
 from include.database.handler import Base, Session, engine
-from include.database.models.entity import Document, DocumentRevision, Folder
-from include.database.models.file import File
+from include.database.models.entity import Folder
 from include.database.models.share import ShareLink  # noqa: F401  (register with Base.metadata)
 from include.handlers.debugging.throw import RequestThrowExceptionHandler
 from include.router import (
@@ -208,20 +207,11 @@ def server_init():
         ],
     )
 
-    with Session() as session:
-        # not using `ROOT_ABSPATH` here to allow easy migration
-        init_file = File(id="init", path="./content/hello", active=True)
-        session.add(init_file)
-
-        init_document = Document(
-            id="hello", title="Hello World", folder_id=ROOT_DIRECTORY_ID
-        )
-        init_document_revision = DocumentRevision(file_id=init_file.id)
-        init_document.revisions.append(init_document_revision)
-        init_document.current_revision = init_document_revision
-        session.add(init_document)
-        session.add(init_document_revision)
-        session.commit()
+    # Network-drive build: do NOT seed any demo content into the global root.
+    # The original CFMS init dropped a "Hello World" document at /, which has
+    # no place in a per-user cloud drive — it would only ever be visible to
+    # sysop, and any stale frontend state from an admin login could leak it
+    # to a regular user's recent-files panel after a tab swap.
 
     import secrets
     import string
