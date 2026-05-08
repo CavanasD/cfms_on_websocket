@@ -13,6 +13,7 @@ __all__ = [
     "NONCE_MIN_LENGTH",
     "ROOT_DIRECTORY_ID",
     "HOME_PARENT_DIRECTORY_ID",
+    "DEFAULT_DISK_QUOTA_BYTES",
     "MAX_PARAM_SIZE",
     "QUERY_CHUNK_SIZE",
     "TRUSTED_PROXY_IPS",
@@ -52,6 +53,10 @@ ROOT_DIRECTORY_ID = "/"
 # Each user's home folder is created at runtime as a child of this folder
 # with a deterministic name equal to their username.
 HOME_PARENT_DIRECTORY_ID = "/home"
+
+# Default per-user disk quota in bytes (1 GiB). Applies to newly created users;
+# existing rows keep whatever value is on the column. Sysop can override per-user.
+DEFAULT_DISK_QUOTA_BYTES = 1024 ** 3
 
 # Database Constants
 MAX_PARAM_SIZE = 950  # Maximum number of parameters in a single SQL query

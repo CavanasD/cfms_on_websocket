@@ -2,7 +2,7 @@ import time
 
 from argon2 import PasswordHasher
 
-from include.constants import HOME_PARENT_DIRECTORY_ID
+from include.constants import DEFAULT_DISK_QUOTA_BYTES, HOME_PARENT_DIRECTORY_ID
 from include.database.handler import Session
 from include.database.models.classic import (
     ObjectAccessEntry,
@@ -127,6 +127,7 @@ def create_user(**kwargs) -> None:
             nickname=kwargs.get("nickname", None),
             last_login=0,
             created_time=time.time(),
+            disk_quota=kwargs.get("disk_quota", DEFAULT_DISK_QUOTA_BYTES),
         )
         for i in kwargs.get("permissions", []):
             permission = UserPermission(

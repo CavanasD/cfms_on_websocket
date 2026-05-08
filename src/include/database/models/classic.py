@@ -120,6 +120,12 @@ class User(Base):
         nullable=True,
     )
 
+    # Per-user disk quota in bytes. NULL means "no limit" (sysop only).
+    # Default for newly registered users is set in util.user.create_user.
+    disk_quota: Mapped[Optional[int]] = mapped_column(
+        Integer, nullable=True, default=None
+    )
+
     def __repr__(self) -> str:
         return (
             f"User(username={self.username!r}, "

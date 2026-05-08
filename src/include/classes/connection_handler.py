@@ -23,6 +23,7 @@ from include.shared import clients, clients_lock
 from include.system.extmgr import pm
 from include.system.messages import Messages as smsg
 from include.util.log import log_exception_with_id
+from include.util.quota import check_quota_for_upload
 
 logger = log.bind(name="conn")
 
@@ -341,6 +342,19 @@ class ConnectionHandler:
 
         ### 获取任务与文件基本信息
         with Session() as session:
+            # Quota check up front, before opening any file or sending "ready".
+            # Skipped for unauthenticated transfers (self.username falsy);
+            # any auth-required upload action will have already enforced login.
+            if self.username and not check_quota_for_upload(
+                session, self.username, file_size
+            ):
+                self.conclude_request(
+                    413,
+                    {},
+                    "Disk quota exceeded",
+                )
+                return
+
             # Query the FileTask table to get the file_id associated with the task_id
             file_task = session.get(FileTask, task_id)
             if not file_task:
@@ -419,6 +433,9 @@ class ConnectionHandler:
                 file_task.status = 1
                 file.sha256 = sha256
                 file.active = True
+                if self.username:
+                    file.uploaded_by = self.username
+                file.stored_size = actual_size
                 session.commit()
 
                 pm.hook.ext_on_file_uploaded(id=file.id, path=file.path, sha256=sha256)

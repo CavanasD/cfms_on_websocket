@@ -41,6 +41,7 @@ from include.constants import (
 from include.database.handler import Base, Session, engine
 from include.database.models.entity import Document, DocumentRevision, Folder
 from include.database.models.file import File
+from include.database.models.share import ShareLink  # noqa: F401  (register with Base.metadata)
 from include.handlers.debugging.throw import RequestThrowExceptionHandler
 from include.router import (
     available_functions,
@@ -231,7 +232,7 @@ def server_init():
     password = "".join(secrets.choice(alphabet) for _ in range(16))
 
     # Admin is a defender/management role only — NOT a cloud-drive end-user.
-    # No "user" group membership, no /home/admin folder.
+    # No "user" group membership, no /home/admin folder, no disk quota.
     create_user(
         username="admin",
         password=password,
@@ -244,6 +245,7 @@ def server_init():
                 "end_time": None,
             },
         ],
+        disk_quota=None,
     )
 
     # 将密码输出到根目录下的 admin_password.txt 文件

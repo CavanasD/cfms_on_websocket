@@ -75,6 +75,17 @@ class File(Base):
     )
     active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
 
+    # Quota attribution. Records who uploaded this blob and the size on disk
+    # at upload time. Both are nullable so legacy rows / system-seeded files
+    # (e.g. the init "hello" file) can stay un-attributed.
+    uploaded_by: Mapped[Optional[str]] = mapped_column(
+        VARCHAR(64),
+        ForeignKey("users.username", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    stored_size: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+
     @property
     def size(self):
         if os.path.exists(self.path):

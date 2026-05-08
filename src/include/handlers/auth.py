@@ -20,6 +20,7 @@ from include.util.pwd import (
     MissingComponentsError,
     check_passwd_requirements,
 )
+from include.util.quota import get_user_disk_usage
 from include.util.user import create_user, ensure_user_home
 
 
@@ -110,6 +111,8 @@ class RequestLoginHandler(RequestHandler):
                 "permissions": list(user.all_permissions),
                 "groups": list(user.all_groups),
                 "home_directory_id": user.home_directory_id,
+                "disk_quota": user.disk_quota,
+                "disk_used": get_user_disk_usage(session, user.username),
             }
 
             if user.preference_dek_id:
