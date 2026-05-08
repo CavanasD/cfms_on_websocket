@@ -34,19 +34,20 @@ from include.conf_loader import global_config
 from include.constants import (
     CORE_VERSION,
     DEFAULT_SSL_CERT_VALIDITY_DAYS,
+    HOME_PARENT_DIRECTORY_ID,
     ROOT_ABSPATH,
     ROOT_DIRECTORY_ID,
 )
 from include.database.handler import Base, Session, engine
-from include.database.models.entity import Document, DocumentRevision, Folder
-from include.database.models.file import File
+from include.database.models.entity import Folder
+from include.database.models.share import ShareLink  # noqa: F401  (register with Base.metadata)
 from include.handlers.debugging.throw import RequestThrowExceptionHandler
 from include.router import (
     available_functions,
     handle_connection,
     whitelisted_functions,
 )
-from include.system.ext_manager import load_extensions_from_directory, pm
+from include.system.extmgr import load_extensions_from_directory, pm
 from include.util.address import is_v6_address
 from include.util.entrance import global_process_request
 from include.util.rule.applying import set_access_rules
@@ -88,6 +89,22 @@ def ensure_root_folder():
             set_access_rules(root, _DEFAULT_ROOT_ACCESS_RULES, inherit_parent=False)
             session.commit()
 
+        # /home is the per-user home directory parent. Listed only by sysop;
+        # regular users access their own home via User.home_directory_id and
+        # the explicit ObjectAccessEntry granted at registration time.
+        if not session.get(Folder, HOME_PARENT_DIRECTORY_ID):
+            home_parent = Folder(
+                id=HOME_PARENT_DIRECTORY_ID,
+                name="home",
+                parent_id=ROOT_DIRECTORY_ID,
+                inherit=False,
+            )
+            session.add(home_parent)
+            set_access_rules(
+                home_parent, _DEFAULT_ROOT_ACCESS_RULES, inherit_parent=False
+            )
+            session.commit()
+
 
 def server_init():
     """
@@ -108,10 +125,33 @@ def server_init():
 
     from include.util.group import create_group
 
+    # Default cloud-drive end-user group. Members own a personal /home/<username>
+    # folder (created at registration). Operations are gated by ACL on the home
+    # folder, so these "verb" permissions only apply where the user has access.
     create_group(
         group_name="user",
         permissions=[
             {"permission": Permissions.SET_PASSWD},
+            {"permission": Permissions.CREATE_DOCUMENT},
+            {"permission": Permissions.CREATE_DIRECTORY},
+            {"permission": Permissions.DELETE_DOCUMENT},
+            {"permission": Permissions.DELETE_DIRECTORY},
+            {"permission": Permissions.RENAME_DOCUMENT},
+            {"permission": Permissions.RENAME_DIRECTORY},
+            {"permission": Permissions.MOVE},
+            {"permission": Permissions.RESTORE},
+            {"permission": Permissions.PURGE},
+            {"permission": Permissions.LIST_DELETED_ITEMS},
+            {"permission": Permissions.LIST_REVISIONS},
+            {"permission": Permissions.VIEW_REVISION},
+            {"permission": Permissions.SET_CURRENT_REVISION},
+            {"permission": Permissions.DELETE_REVISION},
+            {"permission": Permissions.MANAGE_KEYRINGS},
+            {"permission": Permissions.MANAGE_2FA},
+            {"permission": Permissions.GET_USER_INFO},
+            {"permission": Permissions.SET_ACCESS_RULES},
+            {"permission": Permissions.VIEW_ACCESS_RULES},
+            {"permission": Permissions.MANAGE_ACCESS},
         ],
     )
     create_group(
@@ -167,20 +207,11 @@ def server_init():
         ],
     )
 
-    with Session() as session:
-        # not using `ROOT_ABSPATH` here to allow easy migration
-        init_file = File(id="init", path="./content/hello", active=True)
-        session.add(init_file)
-
-        init_document = Document(
-            id="hello", title="Hello World", folder_id=ROOT_DIRECTORY_ID
-        )
-        init_document_revision = DocumentRevision(file_id=init_file.id)
-        init_document.revisions.append(init_document_revision)
-        init_document.current_revision = init_document_revision
-        session.add(init_document)
-        session.add(init_document_revision)
-        session.commit()
+    # Network-drive build: do NOT seed any demo content into the global root.
+    # The original CFMS init dropped a "Hello World" document at /, which has
+    # no place in a per-user cloud drive — it would only ever be visible to
+    # sysop, and any stale frontend state from an admin login could leak it
+    # to a regular user's recent-files panel after a tab swap.
 
     import secrets
     import string
@@ -190,6 +221,8 @@ def server_init():
     alphabet = string.ascii_letters + string.digits + "!@#$%^&*()-_=+[]{};:,.<>?/"
     password = "".join(secrets.choice(alphabet) for _ in range(16))
 
+    # Admin is a defender/management role only — NOT a cloud-drive end-user.
+    # No "user" group membership, no /home/admin folder, no disk quota.
     create_user(
         username="admin",
         password=password,
@@ -201,12 +234,8 @@ def server_init():
                 "start_time": 0,
                 "end_time": None,
             },
-            {
-                "group_name": "user",
-                "start_time": 0,
-                "end_time": None,
-            },
         ],
+        disk_quota=None,
     )
 
     # 将密码输出到根目录下的 admin_password.txt 文件

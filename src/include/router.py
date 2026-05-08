@@ -94,7 +94,15 @@ from include.handlers.revision import (
     RequestListRevisionsHandler,
     RequestSetDocumentRevisionHandler,
 )
+from include.handlers.quota import RequestGetQuotaHandler
 from include.handlers.search import RequestSearchHandler
+from include.handlers.share import (
+    RequestCreateShareLinkHandler,
+    RequestDownloadShareLinkHandler,
+    RequestGetShareLinkInfoHandler,
+    RequestListMyShareLinksHandler,
+    RequestRevokeShareLinkHandler,
+)
 from include.handlers.two_factor import (
     RequestCancel2FASetupHandler,
     RequestDisable2FAHandler,
@@ -104,7 +112,7 @@ from include.handlers.two_factor import (
 )
 from include.nonce_store import nonce_store
 from include.shared import clients, clients_lock, lockdown_enabled
-from include.system.ext_manager import pm
+from include.system.extmgr import pm
 from include.util.address import get_client_ip
 from include.util.audit import log_audit
 from include.util.cert import get_client_cert_subject
@@ -190,6 +198,14 @@ available_functions: dict[str, type[RequestHandler]] = {
     "delete_user_key": RequestDeleteUserKeyHandler,
     "set_user_preference_dek": RequestSetPreferenceDEKHandler,
     "list_user_keys": RequestListUserKeysHandler,
+    # Disk quota
+    "get_quota": RequestGetQuotaHandler,
+    # Share links
+    "create_share_link": RequestCreateShareLinkHandler,
+    "revoke_share_link": RequestRevokeShareLinkHandler,
+    "list_my_share_links": RequestListMyShareLinksHandler,
+    "get_share_link_info": RequestGetShareLinkInfoHandler,
+    "download_share_link": RequestDownloadShareLinkHandler,
 }
 
 # 定义白名单内的请求。这些请求即使在防范禁闭时也对所有用户可用。
@@ -201,6 +217,8 @@ whitelisted_functions = [
     "validate_2fa",
     "upload_file",
     "download_file",
+    "get_share_link_info",
+    "download_share_link",
 ]
 
 

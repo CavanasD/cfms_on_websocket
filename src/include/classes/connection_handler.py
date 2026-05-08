@@ -20,9 +20,10 @@ from include.constants import FILE_TRANSFER_MAX_CHUNK_SIZE, FILE_TRANSFER_MIN_CH
 from include.database.handler import Session
 from include.database.models.file import File, FileTask
 from include.shared import clients, clients_lock
-from include.system.ext_manager import pm
+from include.system.extmgr import pm
 from include.system.messages import Messages as smsg
 from include.util.log import log_exception_with_id
+from include.util.quota import check_quota_for_upload
 
 logger = log.bind(name="conn")
 
@@ -140,9 +141,9 @@ class ConnectionHandler:
         2. Calculates the SHA-256 hash and size of the file.
         3. Notifies the client of the impending file transfer, including the hash and size.
         4. Waits for the client to acknowledge readiness to receive the file.
-        5. Encrypts the file using AES-256 in CFB mode with a randomly generated key and IV.
-        6. Sends the IV with the first encrypted chunk, then sends the remaining encrypted chunks.
-        7. After the file is sent, transmits the AES key and IV to the client (base64 encoded).
+        5. Encrypts the file using AES-256 in GCM mode with a randomly generated key and nonce.
+        6. Sends the nonce with the first encrypted chunk, then sends the remaining encrypted chunks.
+        7. After the file is sent, transmits the AES key and tag to the client (base64 encoded).
         8. Handles errors and logs relevant information.
         Args:
             task_id (str): The identifier for the task whose associated file is to be sent.
@@ -215,8 +216,8 @@ class ConnectionHandler:
                 self.logger.info("File transmission begin.")
                 try:
                     aes_key = get_random_bytes(32)  # AES-256
-                    iv = get_random_bytes(16)
-                    cipher = AES.new(aes_key, AES.MODE_CFB, iv=iv)
+                    nonce = get_random_bytes(16)
+                    cipher = AES.new(aes_key, AES.MODE_GCM, nonce=nonce, mac_len=16)
 
                     with open(file_path, "rb") as file:
                         chunk_index = 0
@@ -231,11 +232,6 @@ class ConnectionHandler:
                                 "data": {
                                     "index": chunk_index,
                                     "hash": chunk_hash,
-                                    "iv": (
-                                        base64.b64encode(iv).decode()
-                                        if chunk_index == 0
-                                        else ""
-                                    ),
                                     "chunk": base64.b64encode(encrypted_chunk).decode(),
                                 },
                             }
@@ -246,14 +242,17 @@ class ConnectionHandler:
                             )
                             chunk_index += 1
 
-                    # 发送密钥和IV
+                    tag = cipher.digest()
+
+                    # send AES key, nonce and tag to client after file transfer is complete
                     self.stream.send(
                         orjson.dumps(
                             {
                                 "action": "aes_key",
                                 "data": {
                                     "key": base64.b64encode(aes_key).decode(),
-                                    # "iv": base64.b64encode(iv).decode(),
+                                    "nonce": base64.b64encode(nonce).decode(),
+                                    "tag": base64.b64encode(tag).decode(),
                                 },
                             },
                         )
@@ -276,7 +275,7 @@ class ConnectionHandler:
         The method performs the following steps:
         1. Waits for the client to send the file transfer request, including the SHA-256 hash and file size.
         2. Acknowledges readiness to receive the file.
-        3. Receives the encrypted file data in chunks, decrypting each chunk using AES-256 in CFB mode.
+        3. Receives the encrypted file data in chunks, decrypting each chunk using AES-256 in GCM mode.
         4. Writes the decrypted data to a file on disk.
         5. Handles errors and logs relevant information.
         Returns:
@@ -343,6 +342,19 @@ class ConnectionHandler:
 
         ### 获取任务与文件基本信息
         with Session() as session:
+            # Quota check up front, before opening any file or sending "ready".
+            # Skipped for unauthenticated transfers (self.username falsy);
+            # any auth-required upload action will have already enforced login.
+            if self.username and not check_quota_for_upload(
+                session, self.username, file_size
+            ):
+                self.conclude_request(
+                    413,
+                    {},
+                    "Disk quota exceeded",
+                )
+                return
+
             # Query the FileTask table to get the file_id associated with the task_id
             file_task = session.get(FileTask, task_id)
             if not file_task:
@@ -421,6 +433,9 @@ class ConnectionHandler:
                 file_task.status = 1
                 file.sha256 = sha256
                 file.active = True
+                if self.username:
+                    file.uploaded_by = self.username
+                file.stored_size = actual_size
                 session.commit()
 
                 pm.hook.ext_on_file_uploaded(id=file.id, path=file.path, sha256=sha256)

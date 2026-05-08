@@ -57,7 +57,9 @@ class User(Base):
     avatar_id: Mapped[Optional[str]] = mapped_column(
         ForeignKey("files.id"), nullable=True
     )
-    avatar: Mapped[Optional["File"]] = relationship("File")
+    # Explicit foreign_keys: since File.uploaded_by also references users.username,
+    # SQLAlchemy now sees two paths between users and files and needs a hint.
+    avatar: Mapped[Optional["File"]] = relationship("File", foreign_keys=[avatar_id])
 
     last_login: Mapped[Optional[float]] = mapped_column(Float)
     created_time: Mapped[Optional[float]] = mapped_column(Float, nullable=False)
@@ -112,6 +114,18 @@ class User(Base):
         uselist=False,
         post_update=True,
         foreign_keys=[preference_dek_id],
+    )
+
+    home_directory_id: Mapped[Optional[str]] = mapped_column(
+        VARCHAR(255),
+        ForeignKey("folders.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+
+    # Per-user disk quota in bytes. NULL means "no limit" (sysop only).
+    # Default for newly registered users is set in util.user.create_user.
+    disk_quota: Mapped[Optional[int]] = mapped_column(
+        Integer, nullable=True, default=None
     )
 
     def __repr__(self) -> str:
