@@ -57,7 +57,9 @@ class User(Base):
     avatar_id: Mapped[Optional[str]] = mapped_column(
         ForeignKey("files.id"), nullable=True
     )
-    avatar: Mapped[Optional["File"]] = relationship("File")
+    # Explicit foreign_keys: since File.uploaded_by also references users.username,
+    # SQLAlchemy now sees two paths between users and files and needs a hint.
+    avatar: Mapped[Optional["File"]] = relationship("File", foreign_keys=[avatar_id])
 
     last_login: Mapped[Optional[float]] = mapped_column(Float)
     created_time: Mapped[Optional[float]] = mapped_column(Float, nullable=False)
