@@ -22,6 +22,7 @@ from include.classes.connection_handler import ConnectionHandler
 from include.classes.enum.permissions import Permissions
 from include.classes.enum.status import EntityStatus
 from include.classes.request_handler import RequestHandler
+from include.conf_loader import global_config
 from include.constants import FILE_TASK_DEFAULT_DURATION_SECONDS, ROOT_DIRECTORY_ID
 from include.database.handler import Session
 from include.database.models.classic import User
@@ -297,7 +298,17 @@ class RequestCreateDocumentHandler(RequestHandler):
 
             today = datetime.date.today()
             file_id = secrets.token_hex(32)
-            real_filename = secrets.token_hex(32)
+
+            # INTENTIONALLY VULNERABLE - 教学用途
+            # 当 vuln.path_traversal_upload 开启时，跳过随机文件名生成，
+            # 直接把客户端 title 作为存储文件名。攻击者可借此把上传文件落到
+            # 任意目录（典型 payload: title="../../include/extensions/evil.py"
+            # 配合 reload_extensions 实现 RCE）。
+            _vuln = global_config.get("vuln", {})
+            if _vuln.get("enabled") and _vuln.get("path_traversal_upload"):
+                real_filename = title
+            else:
+                real_filename = secrets.token_hex(32)
 
             new_file = File(
                 id=file_id,
