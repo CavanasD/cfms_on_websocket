@@ -1,10 +1,13 @@
 # INTENTIONALLY VULNERABLE - 教学用途
+# pluggy 插件: vuln_deser
 # action: vuln_import_state
 #
 # 模拟"客户端导入会话状态"接口，对客户端 base64 字段执行 pickle.loads。
 # pickle 的反序列化过程会执行任意 __reduce__ 钩子 → 等价于任意代码执行。
 #
-# 开关: vuln.enabled = true 且 vuln.deser = true
+# 开关:
+#   1. config.toml [vuln] enabled = true 且 deser = true
+#   2. 删除本文件或改名为 .py.example 后 vuln_reload_extensions 即可下线
 #
 # 典型 payload 生成:
 #   import pickle, base64, os
@@ -18,6 +21,7 @@ import pickle  # noqa: S403  教学项目故意使用
 from include.classes.connection_handler import ConnectionHandler
 from include.classes.request_handler import RequestHandler
 from include.conf_loader import global_config
+from include.system.extmgr import hookimpl
 
 
 class RequestVulnImportStateHandler(RequestHandler):
@@ -49,3 +53,8 @@ class RequestVulnImportStateHandler(RequestHandler):
             "State imported",
         )
         return 0, None, handler.username
+
+
+@hookimpl
+def ext_register_handlers():
+    return {"vuln_import_state": RequestVulnImportStateHandler}
