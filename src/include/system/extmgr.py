@@ -114,6 +114,9 @@ class ServerHookSpecs:
         """
 
 
+_loaded_ext_names: Set[str] = set()
+
+
 def load_extensions_from_directory(extension_dir: str | Path):
 
     if not os.path.isdir(extension_dir):
@@ -122,7 +125,7 @@ def load_extensions_from_directory(extension_dir: str | Path):
         )
         return
 
-    loaded_extensions = set()
+    loaded_extensions: Set[str] = set()
 
     for filename in sorted(os.listdir(extension_dir)):
         if filename.startswith(("_", ".")):
@@ -149,6 +152,12 @@ def load_extensions_from_directory(extension_dir: str | Path):
             continue
 
         try:
+            # Hot-swap: drop any prior registration of this name before reloading,
+            # otherwise pluggy raises ValueError and sys.modules caches stale code.
+            if pm.get_plugin(ext_name) is not None:
+                pm.unregister(name=ext_name)
+            sys.modules.pop(ext_name, None)
+
             spec = importlib.util.spec_from_file_location(ext_name, ext_path)
             if spec is None or spec.loader is None:
                 logger.error(f"Failed to load spec for extension: {ext_name}")
@@ -175,6 +184,19 @@ def load_extensions_from_directory(extension_dir: str | Path):
 
         except Exception as e:
             logger.exception(f"Failed to load extension '{ext_name}': {e}")
+
+    # Hot-swap: drop plugins whose files disappeared from the directory since
+    # the previous load. Only touches names this loader manages, so plugins
+    # registered programmatically elsewhere are left alone.
+    removed = _loaded_ext_names - loaded_extensions
+    for ext_name in removed:
+        if pm.get_plugin(ext_name) is not None:
+            pm.unregister(name=ext_name)
+        sys.modules.pop(ext_name, None)
+        logger.info(f"Unloaded extension: {ext_name}")
+
+    _loaded_ext_names.clear()
+    _loaded_ext_names.update(loaded_extensions)
 
 
 pm = pluggy.PluginManager("cfms")
