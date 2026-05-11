@@ -306,10 +306,6 @@ def server_init():
         f.write("This file indicates that the database has been initialized.\n")
 
 
-_builtin_actions_snapshot: set[str] | None = None
-_builtin_whitelist_snapshot: list[str] | None = None
-
-
 def prepare_handlers():
     """
     Prepares the available request handlers by loading built-in handlers and
@@ -320,22 +316,7 @@ def prepare_handlers():
 
     It also populates the `whitelisted_functions` list with actions that are
     allowed even during lockdown.
-
-    Safe to call repeatedly: on the first call we snapshot the static router
-    baseline; on subsequent calls we purge any plugin-contributed entries
-    before re-applying the hooks, so the dispatch table reflects the current
-    set of registered plugins (used by vuln_reload_extensions hot-swap).
     """
-
-    global _builtin_actions_snapshot, _builtin_whitelist_snapshot
-    if _builtin_actions_snapshot is None:
-        _builtin_actions_snapshot = set(available_functions.keys())
-        _builtin_whitelist_snapshot = list(whitelisted_functions)
-    else:
-        for k in list(available_functions.keys()):
-            if k not in _builtin_actions_snapshot:
-                del available_functions[k]
-        whitelisted_functions[:] = list(_builtin_whitelist_snapshot)
 
     # Debugging
     if global_config["debug"]:

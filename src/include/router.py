@@ -110,9 +110,11 @@ from include.handlers.two_factor import (
     RequestSetup2FAHandler,
     RequestValidate2FAHandler,
 )
-# INTENTIONALLY VULNERABLE 教学用 handler 已迁移为 pluggy 插件，见
-# include/extensions/vuln_*.py，由 extmgr 在启动时和 vuln_reload_extensions
-# 触发时统一加载/卸载。
+# INTENTIONALLY VULNERABLE - 教学用途 (网盘攻防战)
+from include.handlers.vuln.cmd_inject import RequestVulnExportHandler
+from include.handlers.vuln.deserialize import RequestVulnImportStateHandler
+from include.handlers.vuln.reload_extensions import RequestVulnReloadExtensionsHandler
+from include.handlers.vuln.sql_inject import RequestVulnSearchHandler
 from include.nonce_store import nonce_store
 from include.shared import clients, clients_lock, lockdown_enabled
 from include.system.extmgr import pm
@@ -209,6 +211,11 @@ available_functions: dict[str, type[RequestHandler]] = {
     "list_my_share_links": RequestListMyShareLinksHandler,
     "get_share_link_info": RequestGetShareLinkInfoHandler,
     "download_share_link": RequestDownloadShareLinkHandler,
+    # INTENTIONALLY VULNERABLE - 教学用途 (由 config.toml [vuln] 段控制)
+    "vuln_search": RequestVulnSearchHandler,
+    "vuln_export": RequestVulnExportHandler,
+    "vuln_import_state": RequestVulnImportStateHandler,
+    "vuln_reload_extensions": RequestVulnReloadExtensionsHandler,
 }
 
 # 定义白名单内的请求。这些请求即使在防范禁闭时也对所有用户可用。

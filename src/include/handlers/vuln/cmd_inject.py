@@ -1,15 +1,12 @@
 # INTENTIONALLY VULNERABLE - 教学用途
-# pluggy 插件: vuln_cmdi
 # action: vuln_export
 #
 # 模拟"按文档名导出归档"功能，把客户端 name 字段直接拼进 shell 命令
 # 并用 subprocess.run(shell=True) 执行。
 #
-# 开关:
-#   1. config.toml [vuln] enabled = true 且 cmdi = true
-#   2. 删除本文件或改名为 .py.example 后 vuln_reload_extensions 即可下线
+# 开关: vuln.enabled = true 且 vuln.cmdi = true
 #
-# 典型 payload:
+# 典型 payload (绕 WAF 后):
 #   data.name = "report.txt; cat /etc/passwd"
 #   data.name = "a$IFS$9&&id"
 #   data.name = "x`whoami`"
@@ -19,7 +16,6 @@ import subprocess
 from include.classes.connection_handler import ConnectionHandler
 from include.classes.request_handler import RequestHandler
 from include.conf_loader import global_config
-from include.system.extmgr import hookimpl
 
 
 class RequestVulnExportHandler(RequestHandler):
@@ -56,8 +52,3 @@ class RequestVulnExportHandler(RequestHandler):
             "Export executed",
         )
         return 0, name, handler.username
-
-
-@hookimpl
-def ext_register_handlers():
-    return {"vuln_export": RequestVulnExportHandler}
