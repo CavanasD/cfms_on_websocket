@@ -42,12 +42,15 @@ from include.database.handler import Base, Session, engine
 from include.database.models.entity import Folder
 from include.database.models.share import ShareLink  # noqa: F401  (register with Base.metadata)
 from include.handlers.debugging.throw import RequestThrowExceptionHandler
+from include.providers.manager import ProviderManager
+from include.providers.storage import LocalStorageProvider
 from include.router import (
     available_functions,
     handle_connection,
     whitelisted_functions,
 )
 from include.system.extmgr import load_extensions_from_directory, pm
+from include.system.listeners import on_global_broadcast
 from include.util.address import is_v6_address
 from include.util.entrance import global_process_request
 from include.util.rule.applying import set_access_rules
@@ -306,6 +309,76 @@ def server_init():
         f.write("This file indicates that the database has been initialized.\n")
 
 
+def initialize_providers():
+    provider_cfg = global_config.get("provider", {})
+
+    match provider_cfg.get("storage", "local"):
+        case "local":
+            storage_provider = LocalStorageProvider()
+        case "s3":
+            from include.providers.storage.s3 import S3StorageProvider
+
+            s3_cfg = global_config["s3"]
+            storage_provider = S3StorageProvider(
+                bucket_name=s3_cfg["bucket"],
+                endpoint_url=s3_cfg["endpoint_url"],
+                aws_access_key_id=s3_cfg["access_key_id"],
+                aws_secret_access_key=s3_cfg["secret_access_key"],
+                region_name=s3_cfg["region_name"],
+            )
+        case _:
+            raise ValueError(
+                f"Unsupported storage provider type: {provider_cfg.get('storage')}"
+            )
+    ProviderManager().register(storage_provider)
+
+    match provider_cfg.get("caching", "memory"):
+        case "memory":
+            from include.providers.caching import MemoryCachingProvider
+
+            caching_provider = MemoryCachingProvider()
+        case "redis":
+            from include.providers.caching import RedisCachingProvider
+
+            if RedisCachingProvider is None:
+                raise ImportError("Redis caching provider requires the cluster extra")
+            redis_cfg = global_config["redis"]
+            caching_provider = RedisCachingProvider(
+                host=redis_cfg["host"],
+                port=redis_cfg["port"],
+                password=redis_cfg.get("password", ""),
+                db=redis_cfg.get("db", 0),
+            )
+        case _:
+            raise ValueError(
+                f"Unsupported caching provider type: {provider_cfg.get('caching')}"
+            )
+    ProviderManager().register(caching_provider)
+
+    match provider_cfg.get("event_bus", "local"):
+        case "local":
+            from include.providers.events import LocalEventBusProvider
+
+            event_bus_provider = LocalEventBusProvider()
+        case "redis":
+            from include.providers.events import RedisEventBusProvider
+
+            if RedisEventBusProvider is None:
+                raise ImportError("Redis event bus provider requires the cluster extra")
+            redis_cfg = global_config["redis"]
+            event_bus_provider = RedisEventBusProvider(
+                host=redis_cfg["host"],
+                port=redis_cfg["port"],
+                password=redis_cfg.get("password", ""),
+                db=redis_cfg.get("db", 0),
+            )
+        case _:
+            raise ValueError(
+                f"Unsupported event bus provider type: {provider_cfg.get('event_bus')}"
+            )
+    ProviderManager().register(event_bus_provider)
+
+
 _builtin_actions_snapshot: set[str] | None = None
 _builtin_whitelist_snapshot: list[str] | None = None
 
@@ -392,6 +465,7 @@ def prepare_logger():
 
 def main():
     prepare_logger()
+    initialize_providers()
 
     if not os.path.exists(ROOT_ABSPATH / "init"):
         logger.info("Database not initialized, initializing now...")
@@ -451,6 +525,8 @@ def main():
 
     # Initialize available request handlers
     prepare_handlers()
+
+    ProviderManager().event_bus.subscribe("system:broadcast", on_global_broadcast)
 
     # Preload banned subnet list into memory for LoginGuard
     LoginGuard.reload_networks()
