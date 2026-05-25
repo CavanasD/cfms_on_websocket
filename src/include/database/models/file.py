@@ -1,4 +1,3 @@
-import os
 import secrets
 import sys
 import time
@@ -10,6 +9,8 @@ from sqlalchemy.orm import Mapped, Session, mapped_column, relationship
 from sqlalchemy.orm.session import object_session
 
 from include.database.handler import Base
+from include.providers.manager import ProviderManager
+from include.providers.storage import LocalStorageProvider
 
 logger = log.bind(name="database.file")
 
@@ -35,7 +36,7 @@ def _queue_deferred_file_deletion(session: Session, path: str) -> None:
             paths = session.info.pop("pending_delete_files", [])
             for path in paths:
                 try:
-                    os.remove(path)
+                    ProviderManager().storage.remove(path)
                 except FileNotFoundError:
                     pass  # already removed manually — this is fine
                 except OSError as exc:
@@ -88,20 +89,23 @@ class File(Base):
 
     @property
     def size(self):
-        if os.path.exists(self.path):
-            return os.path.getsize(self.path)
-        else:
+        try:
+            return ProviderManager().storage.getsize(self.path)
+        except Exception:
             return None
 
     @property
     def writeable(self):
+        if not isinstance(ProviderManager().storage, LocalStorageProvider):
+            return True
+
         if sys.platform == "win32":
             import pywintypes
             import win32file
 
             hFile = None
             try:
-                if os.path.exists(self.path):
+                if ProviderManager().storage.exists(self.path):
                     hFile = win32file.CreateFile(
                         self.path,
                         win32file.GENERIC_READ + win32file.GENERIC_WRITE,
@@ -151,7 +155,7 @@ class File(Base):
         else:
             # No session context — perform immediate deletion.
             try:
-                os.remove(self.path)
+                ProviderManager().storage.remove(self.path)
             except FileNotFoundError:
                 pass
 
