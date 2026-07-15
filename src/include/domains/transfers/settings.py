@@ -19,6 +19,8 @@ class TransferSettings:
     enabled: bool
     base_url: str
     private_key_file: str
+    issuer: str
+    audience: str
     ticket_ttl_seconds: int
     session_ttl_seconds: int
     chunk_size: int
@@ -40,6 +42,14 @@ def get_transfer_settings() -> TransferSettings:
         private_key_file=os.getenv(
             "CFMS_TRANSFER_PRIVATE_KEY_FILE",
             str(cfg.get("private_key_file", "./content/transfer-private.pem")),
+        ),
+        issuer=os.getenv(
+            "CFMS_TRANSFER_JWT_ISSUER",
+            str(cfg.get("issuer", "thesis-drive-core")),
+        ),
+        audience=os.getenv(
+            "CFMS_TRANSFER_JWT_AUDIENCE",
+            str(cfg.get("audience", "transfer-data-plane")),
         ),
         ticket_ttl_seconds=int(
             os.getenv(

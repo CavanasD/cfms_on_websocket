@@ -32,6 +32,8 @@ def issue_transfer_ticket(
         "object_key": object_key,
         "max_size": max_size,
         "jti": secrets.token_urlsafe(24),
+        "iss": settings.issuer,
+        "aud": settings.audience,
         "iat": now,
         "exp": expires_at,
     }

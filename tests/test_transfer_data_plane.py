@@ -52,13 +52,21 @@ def test_rs256_ticket_binds_transfer_claims(transfer_modules, tmp_path):
         object_key="content/files/object-1",
         max_size=1234,
     )
-    claims = jwt.decode(token, public_key, algorithms=["RS256"])
+    claims = jwt.decode(
+        token,
+        public_key,
+        algorithms=["RS256"],
+        audience="transfer-data-plane",
+        issuer="thesis-drive-core",
+    )
 
     assert claims["task_id"] == "task-1"
     assert claims["username"] == claims["sub"] == "alice"
     assert claims["operation"] == "upload"
     assert claims["object_key"] == "content/files/object-1"
     assert claims["max_size"] == 1234
+    assert claims["iss"] == "thesis-drive-core"
+    assert claims["aud"] == "transfer-data-plane"
     assert claims["exp"] == expires_at
     assert claims["jti"]
 
