@@ -51,6 +51,7 @@ def test_rs256_ticket_binds_transfer_claims(transfer_modules, tmp_path):
         operation="upload",
         object_key="content/files/object-1",
         max_size=1234,
+        expected_sha256="A" * 64,
     )
     claims = jwt.decode(
         token,
@@ -65,6 +66,7 @@ def test_rs256_ticket_binds_transfer_claims(transfer_modules, tmp_path):
     assert claims["operation"] == "upload"
     assert claims["object_key"] == "content/files/object-1"
     assert claims["max_size"] == 1234
+    assert claims["expected_sha256"] == "a" * 64
     assert claims["iss"] == "thesis-drive-core"
     assert claims["aud"] == "transfer-data-plane"
     assert claims["exp"] == expires_at

@@ -154,6 +154,7 @@ class RequestPrepareUploadHandler(_TransferHandler):
             operation="upload",
             object_key=authorized.object_key,
             max_size=expected_size,
+            expected_sha256=handler.data.get("sha256"),
         )
         url = f"{settings.base_url}/api/v1/transfers/{quote(task_id, safe='')}"
         handler.conclude_request(
@@ -221,6 +222,7 @@ class RequestPrepareDownloadHandler(_TransferHandler):
             operation="download",
             object_key=authorized.object_key,
             max_size=size,
+            expected_sha256=authorized.sha256,
         )
         url = (
             f"{settings.base_url}/api/v1/transfers/{quote(task_id, safe='')}/content"

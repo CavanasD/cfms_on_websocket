@@ -20,6 +20,7 @@ def issue_transfer_ticket(
     operation: TransferOperation,
     object_key: str,
     max_size: int,
+    expected_sha256: str | None = None,
 ) -> tuple[str, int]:
     now = int(time.time())
     expires_at = now + settings.ticket_ttl_seconds
@@ -37,4 +38,6 @@ def issue_transfer_ticket(
         "iat": now,
         "exp": expires_at,
     }
+    if expected_sha256:
+        payload["expected_sha256"] = expected_sha256.lower()
     return jwt.encode(payload, private_key, algorithm="RS256"), expires_at
