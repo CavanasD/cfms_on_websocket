@@ -160,7 +160,9 @@ class S3StorageProvider(StorageProvider):
         self._config = Config(
             s3={
                 "signature_version": "s3v4",
-                "addressing_style": "virtual",
+                # Custom S3-compatible endpoints such as MinIO normally do not
+                # provide wildcard DNS for <bucket>.<endpoint>.
+                "addressing_style": "path" if endpoint_url else "virtual",
             }
         )
         self._client = boto3.client(
