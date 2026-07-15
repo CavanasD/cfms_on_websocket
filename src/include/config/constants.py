@@ -12,6 +12,8 @@ __all__ = [
     "REPLAY_PROTECTION_TIME_WINDOW_SECONDS",
     "NONCE_MIN_LENGTH",
     "ROOT_DIRECTORY_ID",
+    "HOME_PARENT_DIRECTORY_ID",
+    "DEFAULT_DISK_QUOTA_BYTES",
     "PAGINATION_DEFAULT_PAGE_SIZE",
     "PAGINATION_MAX_PAGE_SIZE",
     "MAX_PARAM_SIZE",
@@ -48,6 +50,10 @@ NONCE_MIN_LENGTH = 16  # Minimum length of a nonce string
 
 # Root directory virtual folder ID — used to store access rules for the root directory
 ROOT_DIRECTORY_ID = "/"
+
+# Cloud-drive users receive a private child below this non-browsable container.
+HOME_PARENT_DIRECTORY_ID = "/home"
+DEFAULT_DISK_QUOTA_BYTES = 10 * 1024**3
 
 # Pagination Constants
 PAGINATION_DEFAULT_PAGE_SIZE = 128

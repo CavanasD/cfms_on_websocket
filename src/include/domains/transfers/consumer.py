@@ -11,14 +11,29 @@ from loguru import logger
 from include.config.settings import global_config
 from include.database.models.files import FileTask, TransferMode
 from include.database.session import Session
+from include.domains.drive.quota import file_owners_fit_quota
 from include.domains.transfers.settings import TransferSettings, get_transfer_settings
 from include.domains.transfers.store import RedisTransferSessionStore
+from include.providers.manager import ProviderManager
 
 _SHA256_PATTERN = re.compile(r"^[0-9a-fA-F]{64}$")
 
 
 class PermanentTransferEventError(ValueError):
     pass
+
+
+class QuotaExceededTransferEventError(PermanentTransferEventError):
+    error_code = "quota_exceeded"
+
+
+def _remove_rejected_object(object_key: str) -> None:
+    """Delete a data-plane object before its rejected event can be acknowledged."""
+    storage = ProviderManager().storage
+    if storage.remove(object_key):
+        return
+    if storage.exists(object_key):
+        raise RuntimeError(f"Rejected upload object could not be removed: {object_key}")
 
 
 def _redis_client() -> redis.Redis:
@@ -40,9 +55,7 @@ def apply_completion_event(fields: dict[str, str]) -> None:
         raise PermanentTransferEventError("Malformed transfer completion event")
 
     with Session() as session:
-        task = (
-            session.query(FileTask).with_for_update().filter_by(id=task_id).first()
-        )
+        task = session.query(FileTask).with_for_update().filter_by(id=task_id).first()
         if task is None or task.mode != TransferMode.UPLOAD:
             raise PermanentTransferEventError("Upload task does not exist")
         if task.file.path != object_key:
@@ -53,6 +66,11 @@ def apply_completion_event(fields: dict[str, str]) -> None:
                 task.status = 2
                 task.end_time = time.time()
                 session.commit()
+            if fields.get("orphaned", "").lower() == "true":
+                # Transfer reports this only when its own MinIO rollback failed.
+                # A cleanup failure remains transient so the stream event is
+                # replayed instead of acknowledging a known orphan.
+                _remove_rejected_object(object_key)
             return
 
         try:
@@ -69,8 +87,26 @@ def apply_completion_event(fields: dict[str, str]) -> None:
                     "Duplicate completion event conflicts with committed metadata"
                 )
             return
+        if task.status == 2 and not task.file.active:
+            # The database commit may have succeeded before object cleanup or the
+            # Redis status update. Replaying the unacknowledged event must finish
+            # both side effects instead of turning the object into an orphan.
+            _remove_rejected_object(object_key)
+            raise QuotaExceededTransferEventError(
+                "Upload exceeds the document owner's quota"
+            )
         if task.status != 0:
             raise PermanentTransferEventError("Upload task is not pending")
+
+        if not file_owners_fit_quota(session, task.file, size):
+            task.file.active = False
+            task.status = 2
+            task.end_time = time.time()
+            session.commit()
+            _remove_rejected_object(object_key)
+            raise QuotaExceededTransferEventError(
+                "Upload exceeds the document owner's quota"
+            )
 
         task.file.size = size
         task.file.sha256 = sha256
@@ -141,6 +177,15 @@ class TransferCompletionConsumer:
                                     if key in fields
                                 },
                             )
+                        except QuotaExceededTransferEventError as exc:
+                            RedisTransferSessionStore(self.client).client.hset(
+                                RedisTransferSessionStore.key(fields["task_id"]),
+                                mapping={
+                                    "status": "failed",
+                                    "error": exc.error_code,
+                                },
+                            )
+                            self._dead_letter(message_id, fields, str(exc))
                         except PermanentTransferEventError as exc:
                             self._dead_letter(message_id, fields, str(exc))
                         self.client.xack(

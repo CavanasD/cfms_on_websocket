@@ -34,6 +34,7 @@ from include.database.models.security import (
     LoginThrottle,
     TrafficThrottle,
 )
+from include.database.models.shares import ShareLink
 
 __all__ = [
     "AuditEntry",
@@ -57,6 +58,7 @@ __all__ = [
     "ObjectAccessEntry",
     "TrafficThrottle",
     "TransferMode",
+    "ShareLink",
     "User",
     "UserBlockEntry",
     "UserBlockSubEntry",

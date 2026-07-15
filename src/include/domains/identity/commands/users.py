@@ -1,13 +1,51 @@
 import time
 
 from argon2 import PasswordHasher
+from sqlalchemy.orm import Session as ORMSession
 
+from include.config.constants import DEFAULT_DISK_QUOTA_BYTES
 from include.database.models.identity import User, UserMembership, UserPermission
 from include.database.session import Session
 
 # Module-level PasswordHasher instance — reused across all calls to avoid
 # repeated construction overhead.
 _password_hasher = PasswordHasher()
+
+
+def create_user_in_session(session: ORMSession, **kwargs) -> User:
+    """Build and add a user using the caller's transaction."""
+    pass_hash = _password_hasher.hash(kwargs["password"])
+    user = User(
+        username=kwargs["username"],
+        pass_hash=pass_hash,
+        nickname=kwargs.get("nickname"),
+        last_login=0,
+        created_time=time.time(),
+        disk_quota=kwargs.get("disk_quota", DEFAULT_DISK_QUOTA_BYTES),
+    )
+    for item in kwargs.get("permissions", []):
+        user.rights.append(
+            UserPermission(
+                user=user,
+                permission=item["permission"],
+                granted=item.get("granted", True),
+                start_time=item.get("start_time", time.time()),
+                end_time=item.get("end_time"),
+            )
+        )
+
+    for item in kwargs.get("groups", []):
+        user.groups.append(
+            UserMembership(
+                user=user,
+                group_name=item["group_name"],
+                start_time=item.get("start_time", time.time()),
+                end_time=item.get("end_time"),
+            )
+        )
+
+    session.add(user)
+    return user
 
 
 def create_user(**kwargs) -> None:
@@ -43,33 +81,6 @@ def create_user(**kwargs) -> None:
         None: Commits the new user to the database.
     """
 
-    pass_hash = _password_hasher.hash(kwargs["password"])
     with Session() as session:
-        user = User(
-            username=kwargs["username"],
-            pass_hash=pass_hash,
-            nickname=kwargs.get("nickname", None),
-            last_login=0,
-            created_time=time.time(),
-        )
-        for i in kwargs.get("permissions", []):
-            permission = UserPermission(
-                user=user,
-                permission=i["permission"],
-                granted=i.get("granted", True),
-                start_time=i.get("start_time", time.time()),
-                end_time=i.get("end_time", None),
-            )
-            user.rights.append(permission)
-
-        for k in kwargs.get("groups", []):
-            membership = UserMembership(
-                user=user,
-                group_name=k["group_name"],
-                start_time=k.get("start_time", time.time()),
-                end_time=k.get("end_time", None),
-            )
-            user.groups.append(membership)
-
-        session.add(user)
+        create_user_in_session(session, **kwargs)
         session.commit()

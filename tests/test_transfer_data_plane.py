@@ -73,9 +73,7 @@ def test_rs256_ticket_binds_transfer_claims(transfer_modules, tmp_path):
     assert claims["jti"]
 
 
-def test_completion_event_commits_before_it_can_be_acked(
-    transfer_modules, monkeypatch
-):
+def test_completion_event_commits_before_it_can_be_acked(transfer_modules, monkeypatch):
     file_record = SimpleNamespace(
         path="content/files/object-1", size=None, sha256=None, active=False
     )
@@ -113,6 +111,9 @@ def test_completion_event_commits_before_it_can_be_acked(
 
     fake_session = FakeSession()
     monkeypatch.setattr(transfer_modules.consumer, "Session", lambda: fake_session)
+    monkeypatch.setattr(
+        transfer_modules.consumer, "file_owners_fit_quota", lambda *_args: True
+    )
     fields = {
         "event_id": "event-1",
         "task_id": "task-1",
@@ -132,9 +133,7 @@ def test_completion_event_commits_before_it_can_be_acked(
     assert file_record.active is True
 
 
-def test_conflicting_duplicate_completion_is_rejected(
-    transfer_modules, monkeypatch
-):
+def test_conflicting_duplicate_completion_is_rejected(transfer_modules, monkeypatch):
     file_record = SimpleNamespace(
         path="content/files/object-1", size=4, sha256="a" * 64, active=True
     )
@@ -176,4 +175,201 @@ def test_conflicting_duplicate_completion_is_rejected(
                 "sha256": "b" * 64,
                 "status": "completed",
             }
+        )
+
+
+def test_quota_rejection_marks_redis_failed_before_ack(
+    transfer_modules, monkeypatch
+):
+    fields = {
+        "event_id": "event-1",
+        "task_id": "task-1",
+        "object_key": "content/files/object-1",
+        "size": "4",
+        "sha256": "a" * 64,
+        "status": "completed",
+    }
+
+    class RecordingRedis:
+        def __init__(self):
+            self.operations = []
+
+        def hset(self, key, mapping):
+            self.operations.append(("hset", key, mapping))
+
+        def xadd(self, stream, payload):
+            self.operations.append(("xadd", stream, payload))
+
+        def xack(self, stream, group, message_id):
+            self.operations.append(("xack", stream, group, message_id))
+
+    client = RecordingRedis()
+    config = transfer_modules.settings.get_transfer_settings()
+    completion_consumer = transfer_modules.consumer.TransferCompletionConsumer(
+        config, client
+    )
+    monkeypatch.setattr(completion_consumer, "_ensure_group", lambda: None)
+
+    def read_once(_marker, _block):
+        completion_consumer._stop.set()
+        return [(config.stream, [("1-0", fields)])]
+
+    monkeypatch.setattr(completion_consumer, "_read", read_once)
+    monkeypatch.setattr(
+        transfer_modules.consumer,
+        "apply_completion_event",
+        lambda _fields: (_ for _ in ()).throw(
+            transfer_modules.consumer.QuotaExceededTransferEventError(
+                "Upload exceeds quota"
+            )
+        ),
+    )
+
+    completion_consumer._run()
+
+    assert client.operations[0] == (
+        "hset",
+        "transfer:session:task-1",
+        {"status": "failed", "error": "quota_exceeded"},
+    )
+    assert client.operations[1][0] == "xadd"
+    assert client.operations[2] == (
+        "xack",
+        config.stream,
+        config.consumer_group,
+        "1-0",
+    )
+
+
+def test_transient_completion_failure_is_not_acked(transfer_modules, monkeypatch):
+    fields = {
+        "task_id": "task-1",
+        "object_key": "content/files/object-1",
+        "status": "completed",
+    }
+
+    class RecordingRedis:
+        def __init__(self):
+            self.acked = []
+
+        def xack(self, *args):
+            self.acked.append(args)
+
+    client = RecordingRedis()
+    config = transfer_modules.settings.get_transfer_settings()
+    completion_consumer = transfer_modules.consumer.TransferCompletionConsumer(
+        config, client
+    )
+    monkeypatch.setattr(completion_consumer, "_ensure_group", lambda: None)
+
+    def read_once(_marker, _block):
+        completion_consumer._stop.set()
+        return [(config.stream, [("1-0", fields)])]
+
+    monkeypatch.setattr(completion_consumer, "_read", read_once)
+    monkeypatch.setattr(
+        transfer_modules.consumer,
+        "apply_completion_event",
+        lambda _fields: (_ for _ in ()).throw(RuntimeError("storage unavailable")),
+    )
+
+    completion_consumer._run()
+
+    assert client.acked == []
+
+
+class _ScriptRedis:
+    def __init__(self):
+        self.hashes = {}
+        self.ttls = {}
+
+    def eval(self, _script, _numkeys, key, *arguments):
+        cursor = 0
+        requested_ttl = int(arguments[cursor])
+        cursor += 1
+        immutable_count = int(arguments[cursor])
+        cursor += 1
+        exists = key in self.hashes
+        for _ in range(immutable_count):
+            field = str(arguments[cursor])
+            present = int(arguments[cursor + 1]) == 1
+            expected = str(arguments[cursor + 2])
+            cursor += 3
+            if exists and (
+                (present and self.hashes[key].get(field) != expected)
+                or (not present and field in self.hashes[key])
+            ):
+                return [-1, field]
+
+        mapping_count = int(arguments[cursor])
+        cursor += 1
+        mapping = {}
+        for _ in range(mapping_count):
+            mapping[str(arguments[cursor])] = str(arguments[cursor + 1])
+            cursor += 2
+        if not exists:
+            self.hashes[key] = mapping
+            self.ttls[key] = requested_ttl
+
+        flattened = []
+        for field, value in self.hashes[key].items():
+            flattened.extend((field, value))
+        return [0 if exists else 1, self.ttls[key], *flattened]
+
+
+def test_transfer_session_retry_reuses_resume_state_and_rejects_conflicts(
+    protected_test_config,
+):
+    from include.domains.transfers.store import (
+        RedisTransferSessionStore,
+        TransferSessionConflictError,
+    )
+
+    client = _ScriptRedis()
+    store = RedisTransferSessionStore(client)
+    immutable_fields = (
+        "task_id",
+        "username",
+        "operation",
+        "object_key",
+        "max_size",
+        "expected_sha256",
+        "filename",
+        "content_type",
+    )
+    values = {
+        "task_id": "task-1",
+        "username": "alice",
+        "operation": "upload",
+        "object_key": "content/files/object-1",
+        "max_size": 16,
+        "expected_sha256": "a" * 64,
+        "filename": "report.pdf",
+        "content_type": "application/pdf",
+        "offset": 0,
+        "status": "pending",
+        "expires_at": 200,
+    }
+
+    created = store.create_or_reuse(values, 60, immutable_fields=immutable_fields)
+    assert created.created is True
+
+    key = store.key("task-1")
+    client.hashes[key]["offset"] = "8"
+    client.hashes[key]["status"] = "running"
+    client.ttls[key] = 42
+    retry_values = {**values, "offset": 0, "status": "pending", "expires_at": 999}
+    reused = store.create_or_reuse(retry_values, 60, immutable_fields=immutable_fields)
+
+    assert reused.created is False
+    assert reused.ttl_seconds == 42
+    assert reused.values["offset"] == "8"
+    assert reused.values["status"] == "running"
+    assert reused.values["expires_at"] == "200"
+
+    with pytest.raises(TransferSessionConflictError, match="filename"):
+        store.create_or_reuse(
+            {**retry_values, "filename": "different.pdf"},
+            60,
+            immutable_fields=immutable_fields,
         )

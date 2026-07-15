@@ -34,6 +34,7 @@ from include.database.models.files import File
 from include.database.session import Base, Session, engine
 from include.domains.access.authorization.access_rules import set_access_rules
 from include.domains.access.permissions import Permissions
+from include.domains.drive.homes import ensure_home_parent
 from include.domains.operations.broadcast import on_global_broadcast
 from include.domains.security.guards.login import LoginGuard
 from include.domains.security.handlers.debugging import RequestThrowExceptionHandler
@@ -89,7 +90,8 @@ def ensure_root_folder():
             root = Folder(id=ROOT_DIRECTORY_ID, name="/")
             session.add(root)
             set_access_rules(root, _DEFAULT_ROOT_ACCESS_RULES, inherit_parent=False)
-            session.commit()
+        ensure_home_parent(session)
+        session.commit()
 
 
 def server_init():
@@ -119,6 +121,26 @@ def server_init():
         group_name="user",
         permissions=[
             {"permission": Permissions.SET_PASSWD},
+            {"permission": Permissions.CREATE_DOCUMENT},
+            {"permission": Permissions.CREATE_DIRECTORY},
+            {"permission": Permissions.DELETE_DOCUMENT},
+            {"permission": Permissions.DELETE_DIRECTORY},
+            {"permission": Permissions.RENAME_DOCUMENT},
+            {"permission": Permissions.RENAME_DIRECTORY},
+            {"permission": Permissions.MOVE},
+            {"permission": Permissions.RESTORE},
+            {"permission": Permissions.PURGE},
+            {"permission": Permissions.LIST_DELETED_ITEMS},
+            {"permission": Permissions.LIST_REVISIONS},
+            {"permission": Permissions.VIEW_REVISION},
+            {"permission": Permissions.SET_CURRENT_REVISION},
+            {"permission": Permissions.DELETE_REVISION},
+            {"permission": Permissions.MANAGE_KEYRINGS},
+            {"permission": Permissions.MANAGE_2FA},
+            {"permission": Permissions.GET_USER_INFO},
+            {"permission": Permissions.SET_ACCESS_RULES},
+            {"permission": Permissions.VIEW_ACCESS_RULES},
+            {"permission": Permissions.MANAGE_ACCESS},
         ],
     )
     create_group(
@@ -233,11 +255,6 @@ def server_init():
         groups=[
             {
                 "group_name": "sysop",
-                "start_time": 0,
-                "end_time": None,
-            },
-            {
-                "group_name": "user",
                 "start_time": 0,
                 "end_time": None,
             },

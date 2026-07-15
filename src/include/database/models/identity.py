@@ -14,6 +14,7 @@ from argon2 import PasswordHasher
 from argon2.exceptions import InvalidHashError, VerificationError, VerifyMismatchError
 from sqlalchemy import (
     VARCHAR,
+    BigInteger,
     Boolean,
     Float,
     ForeignKey,
@@ -41,6 +42,7 @@ _password_hasher = PasswordHasher()
 
 if TYPE_CHECKING:
     from include.database.models.access import UserBlockEntry
+    from include.database.models.documents import Folder
     from include.database.models.files import File
     from include.database.models.keyrings import UserKey
     from include.database.models.operations import AuditEntry
@@ -168,6 +170,30 @@ class User(Base):
         uselist=False,
         post_update=True,
         foreign_keys=[preference_dek_id],
+    )
+
+    home_directory_id: Mapped[str | None] = mapped_column(
+        VARCHAR(255),
+        ForeignKey(
+            "folders.id",
+            name="fk_users_home_directory_id_folders",
+            ondelete="SET NULL",
+            use_alter=True,
+        ),
+        nullable=True,
+        unique=True,
+    )
+    home_directory: Mapped[Folder | None] = relationship(
+        "Folder",
+        foreign_keys=[home_directory_id],
+        post_update=True,
+        uselist=False,
+    )
+    disk_quota: Mapped[int] = mapped_column(
+        BigInteger,
+        nullable=False,
+        default=10 * 1024**3,
+        server_default=str(10 * 1024**3),
     )
 
     def __repr__(self) -> str:

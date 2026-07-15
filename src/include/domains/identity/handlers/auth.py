@@ -98,9 +98,9 @@ class RequestLoginHandler(RequestHandler):
                         4002, "Password should be changed because it's expired"
                     )
 
-            return respond(
-                200, "Login successful", build_login_success_data(session, user, token)
-            )
+            data = build_login_success_data(session, user, token)
+            session.commit()
+            return respond(200, "Login successful", data)
 
 
 class RequestRefreshTokenHandler(RequestHandler):
