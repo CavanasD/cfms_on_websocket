@@ -77,6 +77,8 @@ def write_test_config(src_dir: Path, port: int) -> ServerTestSettings:
     config["provider"]["storage"] = "local"
     config["provider"]["caching"] = "memory"
     config["provider"]["event_bus"] = "local"
+    config["transfer"]["enabled"] = False
+    config["transfer"]["legacy_websocket_enabled"] = True
 
     atomic_write(config_path, dumps(config).encode("utf-8"))
     return ServerTestSettings(

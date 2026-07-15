@@ -23,6 +23,7 @@ from include.domains.access.permissions import Permissions
 from include.domains.documents.commands.bulk_purge import purge_documents_bulk
 from include.domains.documents.commands.name_conflicts import (
     handle_name_duplicate,
+    lock_name_scope,
 )
 from include.domains.documents.queries.deletion_tree import fetch_subtree_for_deletion
 from include.domains.documents.queries.listing import (
@@ -942,6 +943,8 @@ class RequestRestoreDirectoryHandler(RequestHandler):
                 db_parent_id = folder.parent_id or ROOT_DIRECTORY_ID
 
             final_name = new_name if new_name else folder.name
+
+            lock_name_scope(session, db_parent_id)
 
             target_parent = (
                 session.query(Folder)

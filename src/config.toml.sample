@@ -122,6 +122,22 @@ password = ""
 # Redis database index
 db = 0
 
+[transfer]
+# HTTP data plane is enabled by deployment configuration after Redis, MinIO,
+# and the transfer service are healthy. The legacy WebSocket path exists only
+# for compatibility tests and benchmark comparison.
+enabled = false
+legacy_websocket_enabled = false
+base_url = "http://localhost:8082"
+private_key_file = "./content/transfer-private.pem"
+ticket_ttl_seconds = 900
+session_ttl_seconds = 86400
+chunk_size = 8388608 # 8 MiB
+max_upload_size = 10737418240 # 10 GiB
+completion_stream = "transfer:completed"
+consumer_group = "drive-core"
+consumer_name = "drive-core-1"
+
 [s3]
 # S3 bucket name
 bucket = ""

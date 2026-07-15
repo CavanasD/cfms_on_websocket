@@ -1,3 +1,4 @@
+import asyncio
 import secrets
 import time
 
@@ -8,6 +9,32 @@ from tests.utils import assert_error, assert_success
 
 
 class TestDocumentOperations:
+    @pytest.mark.asyncio
+    async def test_concurrent_same_name_create_has_single_winner(
+        self, authenticated_client: CFMSTestClient
+    ):
+        title = f"Concurrent Name {secrets.token_hex(8)}"
+
+        responses = await asyncio.gather(
+            authenticated_client.create_document(title),
+            authenticated_client.create_document(title),
+        )
+
+        assert sorted(response["code"] for response in responses) == [200, 409]
+
+    @pytest.mark.asyncio
+    async def test_concurrent_document_directory_name_is_exclusive(
+        self, authenticated_client: CFMSTestClient
+    ):
+        name = f"Cross Entity Name {secrets.token_hex(8)}"
+
+        responses = await asyncio.gather(
+            authenticated_client.create_document(name),
+            authenticated_client.create_directory(name),
+        )
+
+        assert sorted(response["code"] for response in responses) == [200, 409]
+
     @pytest.mark.asyncio
     async def test_create_document(
         self, authenticated_client: CFMSTestClient, document_factory

@@ -21,6 +21,7 @@ dependencies = [
     "loguru>=0.7.3",
     "watchdog>=6.0.0",
     "rich>=15.0.0",
+    "redis>=7.4.0",
     "typer>=0.26.7",
 ]
 
@@ -29,7 +30,6 @@ maintain = "maintenance.cli:app"
 
 [project.optional-dependencies]
 cluster = [
-    "redis>=7.4.0",
     "boto3>=1.43.9",
 ]
 mysql = [

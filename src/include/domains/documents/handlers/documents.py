@@ -23,6 +23,7 @@ from include.config.constants import (
     FILE_TASK_DEFAULT_DURATION_SECONDS,
     ROOT_DIRECTORY_ID,
 )
+from include.config.settings import global_config
 from include.database.models.documents import (
     Document,
     DocumentMetadata,
@@ -43,6 +44,7 @@ from include.domains.access.permissions import Permissions
 from include.domains.documents.commands.name_conflicts import (
     get_target_folder_and_check_write,
     handle_name_duplicate,
+    lock_name_scope,
 )
 from include.exceptions.misc import NoActiveRevisionsError
 from include.messages import Messages as smsg
@@ -51,7 +53,10 @@ from include.transport.request_handler import RequestHandler, Result
 
 
 def create_file_task(
-    file: File, transfer_mode: TransferMode = TransferMode.DOWNLOAD
+    file: File,
+    transfer_mode: TransferMode = TransferMode.DOWNLOAD,
+    *,
+    session=None,
 ) -> dict[str, Any]:
     """Creates a new file processing task for the specified file.
 
@@ -67,20 +72,20 @@ def create_file_task(
         Returns None if the file with the given file_id does not exist.
 
     """
-    with Session() as session:
+    def _create(active_session):
         if not file:
             raise ValueError("File can not be None when creating a file task")
 
         now = time.time()
         task = FileTask(
+            id=secrets.token_hex(32),
             file_id=file.id,
             status=0,
             mode=transfer_mode,
             start_time=now,
             end_time=now + FILE_TASK_DEFAULT_DURATION_SECONDS,
         )
-        session.add(task)
-        session.commit()
+        active_session.add(task)
 
         return {
             "task_id": task.id,
@@ -90,6 +95,14 @@ def create_file_task(
             # Only download tasks support resume
             "supports_resume": transfer_mode == TransferMode.DOWNLOAD,
         }
+
+    if session is not None:
+        return _create(session)
+
+    with Session() as own_session:
+        task_data = _create(own_session)
+        own_session.commit()
+        return task_data
 
 
 def get_or_create_document_metadata(document: Document) -> DocumentMetadata:
@@ -330,13 +343,16 @@ class RequestCreateDocumentHandler(RequestHandler):
                 session, user, folder_id, title
             )
             if has_conflict:
-                handler.conclude_request(err_code, err_data, err_msg)
+                public_error_data = {
+                    key: value for key, value in err_data.items() if key != "entity"
+                }
+                handler.conclude_request(err_code, public_error_data, err_msg)
                 return Result(
                     code=err_code,
                     target=folder_id,
                     data={
                         "title": title,
-                        "duplicate_id": err_data.get("duplicate_id"),
+                        "duplicate_id": public_error_data.get("duplicate_id"),
                     },
                     username=handler.username,
                 )
@@ -378,11 +394,12 @@ class RequestCreateDocumentHandler(RequestHandler):
                     )
 
                 new_document.current_revision = new_revision
-                session.commit()
-
                 task_data = create_file_task(
-                    new_revision.file, transfer_mode=TransferMode.UPLOAD
+                    new_revision.file,
+                    transfer_mode=TransferMode.UPLOAD,
+                    session=session,
                 )
+                session.commit()
                 handler.conclude_request(
                     200,
                     {"document_id": new_document.id, "task_data": task_data},
@@ -648,6 +665,13 @@ class RequestDownloadFileHandler(RequestHandler):
     }
 
     def handle(self, handler: ConnectionHandler):
+        if not global_config.get("transfer", {}).get(
+            "legacy_websocket_enabled", True
+        ):
+            handler.conclude_request(
+                410, {}, "Legacy WebSocket transfer is disabled; use prepare_download"
+            )
+            return
         task_id: str = handler.data["task_id"]
         offset: int = handler.data.get("offset", 0)
 
@@ -688,6 +712,13 @@ class RequestUploadFileHandler(RequestHandler):
     }
 
     def handle(self, handler: ConnectionHandler):
+        if not global_config.get("transfer", {}).get(
+            "legacy_websocket_enabled", True
+        ):
+            handler.conclude_request(
+                410, {}, "Legacy WebSocket transfer is disabled; use prepare_upload"
+            )
+            return
         task_id = handler.data["task_id"]
 
         with Session() as session:
@@ -1027,6 +1058,8 @@ class RequestRestoreDocumentHandler(RequestHandler):
                 db_folder_id = document.folder_id or ROOT_DIRECTORY_ID
 
             final_title = new_title if new_title else document.title
+
+            lock_name_scope(session, db_folder_id)
 
             target_folder = session.get(
                 Folder, db_folder_id, execution_options={"include_deleted": True}

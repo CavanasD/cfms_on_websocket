@@ -34,12 +34,22 @@ class RequestServerInfoHandler(RequestHandler):
 
     def handle(self, handler: ConnectionHandler):
 
+        extension_flags = collect_extension_flags()
+        transfer_config = global_config.get("transfer", {})
         server_info = {
             "server_name": global_config["server"]["name"],
             "version": CORE_VERSION.original,
             "protocol_version": PROTOCOL_VERSION,
             "lockdown": lockdown_enabled.is_set(),
-            "extension_flags": collect_extension_flags(),
+            "extension_flags": extension_flags,
+            "capabilities": {
+                flag: True for flag in extension_flags
+            }
+            | {
+                "legacy_websocket_transfer": bool(
+                    transfer_config.get("legacy_websocket_enabled", True)
+                )
+            },
         }
         handler.conclude_request(
             200, server_info, "Server information retrieved successfully"
