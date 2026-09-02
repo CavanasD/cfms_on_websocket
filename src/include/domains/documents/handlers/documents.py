@@ -30,6 +30,7 @@ from include.config.constants import (
 )
 from include.config.validation import DocumentUploadPolicy
 from include.database.clock import database_now
+from include.config.settings import global_config
 from include.database.models.documents import (
     Document,
     DocumentMetadata,
@@ -833,6 +834,9 @@ class RequestDownloadFileHandler(RequestHandler):
     rate_limit_cost = 5
 
     def handle(self, handler: ConnectionHandler):
+        if not global_config.get("transfer", {}).get("legacy_websocket_enabled", True):
+            handler.conclude_request(410, {}, "Legacy WebSocket transfer is disabled; use prepare_download")
+            return
         task_id: str = handler.data["task_id"]
         offset: int = handler.data.get("offset", 0)
         max_chunk_size: int = handler.data["max_chunk_size"]
@@ -848,6 +852,9 @@ class RequestUploadFileHandler(RequestHandler):
     rate_limit_cost = 5
 
     def handle(self, handler: ConnectionHandler):
+        if not global_config.get("transfer", {}).get("legacy_websocket_enabled", True):
+            handler.conclude_request(410, {}, "Legacy WebSocket transfer is disabled; use prepare_upload")
+            return
         task_id = handler.data["task_id"]
         file_size = handler.data["file_size"]
         sha256 = handler.data["sha256"]

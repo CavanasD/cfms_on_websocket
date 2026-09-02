@@ -269,6 +269,7 @@ dependencies = [
     { name = "pyjwt" },
     { name = "pyotp" },
     { name = "pywin32", marker = "sys_platform == 'win32'" },
+    { name = "redis" },
     { name = "rich" },
     { name = "sqlalchemy" },
     { name = "tomlkit" },
@@ -280,7 +281,6 @@ dependencies = [
 [package.optional-dependencies]
 cluster = [
     { name = "boto3" },
-    { name = "redis" },
 ]
 ext-http-api = [
     { name = "fastapi" },
@@ -334,7 +334,7 @@ requires-dist = [
     { name = "pyjwt", specifier = ">=2.10.1" },
     { name = "pyotp", specifier = ">=2.9.0" },
     { name = "pywin32", marker = "sys_platform == 'win32'" },
-    { name = "redis", marker = "extra == 'cluster'", specifier = ">=7.4.0" },
+    { name = "redis", specifier = ">=7.4.0" },
     { name = "requests", marker = "extra == 'ext-oidc-sso'", specifier = ">=2.34.2" },
     { name = "rich", specifier = ">=15.0.0" },
     { name = "sqlalchemy", specifier = ">=2.0.44" },

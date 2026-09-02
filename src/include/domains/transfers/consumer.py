@@ -44,6 +44,8 @@ def _redis_client() -> redis.Redis:
         password=cfg.get("password", ""),
         db=cfg.get("db", 0),
         decode_responses=True,
+        socket_connect_timeout=5,
+        socket_timeout=10,
     )
 
 
@@ -150,13 +152,14 @@ class TransferCompletionConsumer:
         self.client.xadd(f"{self.settings.stream}:dead-letter", payload)
 
     def _read(self, marker: str, block: int) -> list:
-        return self.client.xreadgroup(
+        batches = self.client.xreadgroup(
             self.settings.consumer_group,
             self.settings.consumer_name,
             {self.settings.stream: marker},
             count=16,
             block=block,
         )
+        return [(stream, messages) for stream, messages in batches if messages]
 
     def _run(self) -> None:
         while not self._stop.is_set():

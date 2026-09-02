@@ -9,7 +9,7 @@ from include.database.models.access import ObjectAccessEntry
 from include.database.models.documents import Folder
 from include.database.models.identity import User
 from include.domains.access.authorization.access_rules import set_access_rules
-from include.domains.documents.commands.name_conflicts import lock_name_scope
+from sqlalchemy import select
 
 _SYSOP_RULE = {
     "match": "all",
@@ -31,7 +31,7 @@ def ensure_home_parent(session: Session) -> Folder:
     if existing is not None:
         return existing
 
-    root = lock_name_scope(session, ROOT_DIRECTORY_ID)
+    root = session.scalar(select(Folder).where(Folder.id == ROOT_DIRECTORY_ID).with_for_update())
     if root is None:
         raise RuntimeError("Root directory must exist before creating user homes")
 
@@ -53,7 +53,7 @@ def ensure_home_parent(session: Session) -> Folder:
 def ensure_user_home(session: Session, user: User) -> str:
     """Create one private home for ``user`` in the caller's transaction."""
     parent = ensure_home_parent(session)
-    lock_name_scope(session, parent.id)
+    session.scalar(select(Folder).where(Folder.id == parent.id).with_for_update())
 
     locked_user = (
         session.query(User)

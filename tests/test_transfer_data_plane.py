@@ -23,6 +23,14 @@ def transfer_modules(monkeypatch, tmp_path):
     return SimpleNamespace(consumer=consumer, settings=settings, tickets=tickets)
 
 
+def test_completion_socket_timeout_exceeds_blocking_read(transfer_modules, monkeypatch):
+    captured = {}
+    monkeypatch.setattr(transfer_modules.consumer.redis, "Redis", lambda **kwargs: captured.update(kwargs))
+    transfer_modules.consumer._redis_client()
+    assert captured["socket_timeout"] > 5000 / 1000
+    assert captured["socket_connect_timeout"] == 5
+
+
 def test_rs256_ticket_binds_transfer_claims(transfer_modules, tmp_path):
     private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
     private_path = tmp_path / "private.pem"
@@ -71,6 +79,24 @@ def test_rs256_ticket_binds_transfer_claims(transfer_modules, tmp_path):
     assert claims["aud"] == "transfer-data-plane"
     assert claims["exp"] == expires_at
     assert claims["jti"]
+
+
+def test_empty_pending_stream_does_not_starve_new_completions(transfer_modules):
+    from unittest.mock import Mock
+
+    client = Mock()
+    settings = transfer_modules.settings.get_transfer_settings()
+    event = ("1-0", {"task_id": "new-upload", "status": "completed"})
+    client.xreadgroup.side_effect = [
+        [(settings.stream, [])],
+        [(settings.stream, [event])],
+    ]
+    consumer = transfer_modules.consumer.TransferCompletionConsumer(settings, client)
+
+    batches = consumer._read("0", 1) or consumer._read(">", 5000)
+
+    assert batches == [(settings.stream, [event])]
+    assert client.xreadgroup.call_args.args[2] == {settings.stream: ">"}
 
 
 def test_completion_event_commits_before_it_can_be_acked(transfer_modules, monkeypatch):

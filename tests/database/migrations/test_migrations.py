@@ -80,7 +80,7 @@ def test_retained_revision_chain_round_trips_to_head(
     config.set_main_option("sqlalchemy.url", database_url)
 
     scripts = ScriptDirectory.from_config(config)
-    assert scripts.get_base() == "fe8863687aa4"
+    assert scripts.get_base() == "cbd5f06cfb68"
     expected_heads = tuple(scripts.get_heads())
     engine = create_engine(database_url)
     try:

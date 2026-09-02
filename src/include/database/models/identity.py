@@ -27,6 +27,7 @@ from sqlalchemy.orm.session import object_session
 from include.config.constants import (
     DEFAULT_TOKEN_EXPIRY_SECONDS,
     USERNAME_DATABASE_MAX_LENGTH,
+    DEFAULT_DISK_QUOTA_BYTES,
 )
 from include.config.settings import global_config
 from include.database.session import Base, Session
@@ -199,8 +200,8 @@ class User(Base):
     disk_quota: Mapped[int] = mapped_column(
         BigInteger,
         nullable=False,
-        default=10 * 1024**3,
-        server_default=str(10 * 1024**3),
+        default=DEFAULT_DISK_QUOTA_BYTES,
+        server_default=str(DEFAULT_DISK_QUOTA_BYTES),
     )
 
     def __repr__(self) -> str:
@@ -281,6 +282,10 @@ class User(Base):
         new_token.new(DEFAULT_TOKEN_EXPIRY_SECONDS)
 
         return new_token
+
+    def invalidate_tokens(self) -> None:
+        """Invalidate every existing JWT for this user."""
+        self.secret_key = secrets.token_hex(32)
 
     def set_password(
         self, plain_password: str, force_update_after_login: bool = False

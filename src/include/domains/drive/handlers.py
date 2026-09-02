@@ -8,6 +8,7 @@ from include.database.models.documents import Document
 from include.database.models.identity import User, UserGroup
 from include.database.models.shares import ShareLink
 from include.database.session import Session
+from include.domains.access.authorization.evaluation import check_access_requirements
 from include.domains.drive.homes import ensure_user_home
 from include.domains.drive.quota import get_user_disk_usage
 from include.domains.drive.shares import (
@@ -22,7 +23,8 @@ from include.domains.identity.validators.passwords import check_passwd_requireme
 from include.domains.transfers.settings import get_transfer_settings
 from include.domains.transfers.store import RedisTransferSessionStore
 from include.transport.connection import ConnectionHandler
-from include.transport.request_handler import RequestHandler, Result
+from include.transport.request_handler import Result
+from include.extensions.thesis_request import ThesisRequestHandler as RequestHandler
 
 
 class RequestRegisterHandler(RequestHandler):
@@ -124,7 +126,7 @@ class RequestCreateShareLinkHandler(RequestHandler):
             if document is None:
                 handler.conclude_request(404, {}, "Document not found")
                 return Result(code=404, target=document_id, username=handler.username)
-            if not document.check_access_requirements(user, "read"):
+            if not check_access_requirements(session, user, document, "read"):
                 handler.conclude_access_denial()
                 return Result(code=403, target=document_id, username=handler.username)
 

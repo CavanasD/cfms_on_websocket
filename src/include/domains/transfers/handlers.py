@@ -11,6 +11,7 @@ from include.database.models.documents import DocumentRevision
 from include.database.models.files import FileTask, TransferMode
 from include.database.models.identity import User
 from include.database.session import Session
+from include.domains.access.authorization.evaluation import check_access_requirements
 from include.domains.drive.quota import file_owners_fit_quota
 from include.domains.transfers.settings import get_transfer_settings
 from include.domains.transfers.store import (
@@ -23,7 +24,8 @@ from include.domains.transfers.tickets import (
     issue_transfer_ticket,
 )
 from include.transport.connection import ConnectionHandler
-from include.transport.request_handler import RequestHandler, Result
+from include.transport.request_handler import Result
+from include.extensions.thesis_request import ThesisRequestHandler as RequestHandler
 
 
 @dataclass(frozen=True)
@@ -67,7 +69,7 @@ def _authorize_task(
                 revision
                 for revision in revisions
                 if revision.document
-                and revision.document.check_access_requirements(user, access_type)
+                and check_access_requirements(session, user, revision.document, access_type)
             ),
             None,
         )

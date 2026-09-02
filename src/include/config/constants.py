@@ -64,7 +64,7 @@ ROOT_DIRECTORY_ID = "/"
 
 # Cloud-drive users receive a private child below this non-browsable container.
 HOME_PARENT_DIRECTORY_ID = "/home"
-DEFAULT_DISK_QUOTA_BYTES = 10 * 1024**3
+DEFAULT_DISK_QUOTA_BYTES = 200 * 1024**2
 
 # Pagination Constants
 PAGINATION_DEFAULT_PAGE_SIZE = 128

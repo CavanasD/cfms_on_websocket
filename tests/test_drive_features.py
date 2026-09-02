@@ -35,6 +35,10 @@ def drive_session_factory(protected_test_config, tmp_path):
 
     Base.metadata.create_all(engine)
     factory = sessionmaker(bind=engine, expire_on_commit=False)
+    from include.database.models.documents import Folder
+    with factory() as session:
+        session.add(Folder(id="/", name="/", parent_id=None, inherit=False))
+        session.commit()
     yield factory
     engine.dispose()
 
@@ -83,7 +87,6 @@ def test_personal_home_is_private_and_idempotent(drive_session_factory):
     from include.domains.drive.homes import ensure_user_home
 
     with drive_session_factory() as session:
-        session.add(Folder(id=ROOT_DIRECTORY_ID, name="/", inherit=False))
         user = _new_user("alice")
         session.add(user)
         session.flush()
@@ -100,7 +103,8 @@ def test_personal_home_is_private_and_idempotent(drive_session_factory):
         home = session.get(Folder, first_id)
         assert home.parent_id == HOME_PARENT_DIRECTORY_ID
         assert home.inherit is False
-        assert home.check_access_requirements(user, "read") is True
+        from include.domains.access.authorization.evaluation import check_access_requirements
+        assert check_access_requirements(session, user, home, "read") is True
         grants = (
             session.query(ObjectAccessEntry)
             .filter_by(
@@ -783,7 +787,7 @@ async def test_frontend_registration_home_and_share_contract(
         login = await unauthenticated_client.login(username, password)
         assert login["code"] == 200
         assert login["data"]["home_directory_id"]
-        assert login["data"]["disk_quota"] == 10 * 1024**3
+        assert login["data"]["disk_quota"] == 200 * 1024**2
         assert login["data"]["disk_used"] == 0
 
         created = await unauthenticated_client.create_directory(
@@ -801,7 +805,7 @@ async def test_frontend_registration_home_and_share_contract(
 
         quota = await unauthenticated_client.send_request("get_quota", {})
         assert quota["code"] == 200
-        assert quota["data"]["disk_quota"] == 10 * 1024**3
+        assert quota["data"]["disk_quota"] == 200 * 1024**2
         assert quota["data"]["disk_used"] == Path("pyproject.toml").stat().st_size
 
         created_share = await unauthenticated_client.send_request(
