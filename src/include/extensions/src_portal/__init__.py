@@ -1,0 +1,1 @@
+"""Thesis Security Center extension."""

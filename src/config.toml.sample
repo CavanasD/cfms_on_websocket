@@ -4,7 +4,7 @@ debug = false
 [extensions]
 # Extension identifiers to load, in registration order. Changes require a restart.
 # Add "scheduling" only to expose schedule query and configuration actions.
-enabled = []
+enabled = ["drive", "transfer_data_plane", "thesis_attack_lab", "src_portal"]
 
 # Automatically enter lockdown after a service-wide burst of failed local
 # password or TOTP authentication attempts.

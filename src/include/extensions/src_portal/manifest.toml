@@ -1,0 +1,12 @@
+manifest_version = 2
+
+[extension]
+identifier = "src_portal"
+name = "Thesis src_portal"
+version = "1.0.0"
+authors = ["ThesisDrive contributors"]
+license = "LicenseRef-ThesisDrive"
+description = "ThesisDrive project extension"
+
+[compatibility]
+minimum_server_version = "0.8.0"

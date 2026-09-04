@@ -54,6 +54,11 @@ from include.database.models.security import (
     TrafficThrottle,
 )
 from include.database.models.shares import ShareLink
+from include.database.models.src_reports import (
+    SrcReport,
+    SrcReportAttachment,
+    SrcReportEvent,
+)
 
 __all__ = [
     "AccountThrottle",
@@ -89,6 +94,9 @@ __all__ = [
     "TrafficThrottle",
     "TransferMode",
     "ShareLink",
+    "SrcReport",
+    "SrcReportAttachment",
+    "SrcReportEvent",
     "User",
     "UserBlockEntry",
     "UserBlockSubEntry",
