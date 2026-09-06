@@ -4,15 +4,18 @@ import os
 import threading
 import time
 from collections import deque
-from typing import Any
+from typing import Any, ClassVar
 
 import orjson
 from loguru import logger as log
 
+from include.database.models.identity import User
+from include.database.session import Session
 from include.extensions.manager import hookimpl
 from include.providers.manager import ProviderManager
 from include.transport.connection import ConnectionHandler
-from include.transport.request_handler import RequestHandler, Result
+from include.transport.request_handler import Result
+from include.extensions.thesis_request import ThesisRequestHandler as RequestHandler
 
 logger = log.bind(name="thesis_attack_lab")
 
@@ -111,10 +114,6 @@ CHAIN_STEPS = {
     "identity_takeover": ("enumerate", "bypass", "idor"),
     "sandbox_breach": ("traverse", "execute"),
 }
-CHAIN_REQUIREMENTS = {
-    "identity_takeover": frozenset({"sqli", "auth_bypass", "idor"}),
-    "sandbox_breach": frozenset({"path_traversal", "rce"}),
-}
 CHAIN_EXERCISES = {
     ("identity_takeover", "enumerate"): {
         "action": "lab_sqli",
@@ -137,10 +136,26 @@ CHAIN_EXERCISES = {
         "data": {"command": "read-honeytoken"},
     },
 }
+EXERCISES = {
+    step: exercise for (_chain, step), exercise in CHAIN_EXERCISES.items()
+}
+EXERCISE_FEATURES = {
+    "enumerate": "sqli",
+    "bypass": "auth_bypass",
+    "idor": "idor",
+    "traverse": "path_traversal",
+    "execute": "rce",
+}
+CHAIN_REQUIREMENTS = {
+    chain: frozenset(EXERCISE_FEATURES[step] for step in steps)
+    for chain, steps in CHAIN_STEPS.items()
+}
 
 _state_lock = threading.RLock()
 _alerts: deque[dict[str, Any]] = deque(maxlen=100)
 _chain_progress = {name: 0 for name in CHAIN_STEPS}
+_custom_chains: dict[str, tuple[str, tuple[str, ...]]] = {}
+_runtime_feature_overrides: dict[str, bool] = {}
 _epoch = 1
 _alert_sequence = 0
 
@@ -152,11 +167,88 @@ def _env_true(name: str) -> bool:
 def _enabled_features() -> set[str]:
     if not _env_true("LAB_MODE"):
         return set()
-    return {name for name, env_name in FEATURE_ENV.items() if _env_true(env_name)}
+    with _state_lock:
+        return {
+            name
+            for name, env_name in FEATURE_ENV.items()
+            if _runtime_feature_overrides.get(name, _env_true(env_name))
+        }
 
 
 def _feature_enabled(name: str) -> bool:
     return name in _enabled_features()
+
+
+def _lab_mode_enabled() -> bool:
+    return _env_true("LAB_MODE")
+
+
+def _set_feature_enabled(feature: str, enabled: bool) -> bool:
+    if feature not in FEATURE_ENV or (enabled and not _lab_mode_enabled()):
+        return False
+    with _state_lock:
+        _runtime_feature_overrides[feature] = enabled
+    logger.warning(f"[LAB VULN SWITCH] {feature} -> {enabled}")
+    return True
+
+
+def _chain_definition(chain: str) -> tuple[str, tuple[str, ...]] | None:
+    if chain in CHAIN_STEPS:
+        return chain.replace("_", " ").title(), CHAIN_STEPS[chain]
+    with _state_lock:
+        return _custom_chains.get(chain)
+
+
+def _chain_requirements(chain: str) -> frozenset[str] | None:
+    definition = _chain_definition(chain)
+    if definition is None:
+        return None
+    return frozenset(EXERCISE_FEATURES[step] for step in definition[1])
+
+
+def _chain_snapshot() -> list[dict[str, Any]]:
+    with _state_lock:
+        definitions = {
+            **{
+                name: (name.replace("_", " ").title(), steps)
+                for name, steps in CHAIN_STEPS.items()
+            },
+            **_custom_chains,
+        }
+        enabled_features = _enabled_features()
+        return [
+            {
+                "id": chain,
+                "title": title,
+                "steps": list(steps),
+                "required_features": sorted(
+                    EXERCISE_FEATURES[step] for step in steps
+                ),
+                "available": {EXERCISE_FEATURES[step] for step in steps}
+                <= enabled_features,
+                "custom": chain in _custom_chains,
+            }
+            for chain, (title, steps) in definitions.items()
+        ]
+
+
+def _is_sysop(username: str | None) -> bool:
+    if not username:
+        return False
+    with Session() as session:
+        user = session.get(User, username)
+        return user is not None and "sysop" in user.all_groups
+
+
+def _require_lab_admin(handler: ConnectionHandler) -> Result | None:
+    if _is_sysop(handler.username):
+        return None
+    return _finish(
+        handler,
+        403,
+        {"lab": _lab_mode_enabled(), "required_role": "sysop"},
+        "LAB configuration requires the sysop role",
+    )
 
 
 def _finish(
@@ -257,7 +349,7 @@ def _normalize_virtual_path(probe: str) -> str | None:
 
 
 def _chain_is_enabled(chain: str) -> bool:
-    requirements = CHAIN_REQUIREMENTS.get(chain)
+    requirements = _chain_requirements(chain)
     return requirements is not None and requirements <= _enabled_features()
 
 
@@ -549,7 +641,7 @@ class RequestResetLabHandler(RequestHandler):
     schema = {"type": "object", "properties": {}, "additionalProperties": False}
 
     def handle(self, handler: ConnectionHandler) -> Result:
-        if not _enabled_features():
+        if not _lab_mode_enabled():
             return _finish(handler, 403, {"lab": False}, "Attack lab is disabled")
         state = _reset_lab_state()
         return _finish(
@@ -571,9 +663,9 @@ class RequestLabStatusHandler(RequestHandler):
     schema = {"type": "object", "properties": {}, "additionalProperties": False}
 
     def handle(self, handler: ConnectionHandler) -> Result:
-        features = _enabled_features()
-        if not features:
+        if not _lab_mode_enabled():
             return _finish(handler, 403, {"lab": False}, "Attack lab is disabled")
+        features = _enabled_features()
         return _finish(
             handler,
             200,
@@ -581,11 +673,128 @@ class RequestLabStatusHandler(RequestHandler):
                 "lab": True,
                 "enabled_features": sorted(features),
                 "available_chains": [
-                    chain for chain in CHAIN_STEPS if _chain_is_enabled(chain)
+                    chain["id"] for chain in _chain_snapshot() if chain["available"]
                 ],
+                "chains": _chain_snapshot(),
+                "available_exercises": sorted(EXERCISES),
                 **_state_snapshot(),
             },
             "Attack lab status retrieved",
+        )
+
+
+class RequestLabSetVulnerabilityHandler(RequestHandler):
+    require_auth = True
+    schema: ClassVar[dict[str, Any]] = {
+        "type": "object",
+        "properties": {
+            "feature": {"type": "string", "enum": sorted(FEATURE_ENV)},
+            "enabled": {"type": "boolean"},
+        },
+        "required": ["feature", "enabled"],
+        "additionalProperties": False,
+    }
+
+    def handle(self, handler: ConnectionHandler) -> Result:
+        if denied := _require_lab_admin(handler):
+            return denied
+        feature = handler.data["feature"]
+        enabled = handler.data["enabled"]
+        if not _set_feature_enabled(feature, enabled):
+            return _finish(
+                handler,
+                403,
+                {"lab": False, "feature": feature, "enabled": False},
+                "LAB_MODE is disabled",
+                target=feature,
+            )
+        return _finish(
+            handler,
+            200,
+            {
+                "lab": True,
+                "feature": feature,
+                "enabled": enabled,
+                "enabled_features": sorted(_enabled_features()),
+            },
+            "LAB vulnerability switch updated",
+            target=feature,
+        )
+
+
+class RequestLabConfigureChainHandler(RequestHandler):
+    require_auth = True
+    schema: ClassVar[dict[str, Any]] = {
+        "type": "object",
+        "properties": {
+            "chain": {
+                "type": "string",
+                "pattern": "^custom-[a-z][a-z0-9_-]{0,39}$",
+            },
+            "title": {"type": "string", "minLength": 1, "maxLength": 80},
+            "steps": {
+                "type": "array",
+                "minItems": 1,
+                "maxItems": 5,
+                "items": {"type": "string", "enum": sorted(EXERCISES)},
+            },
+        },
+        "required": ["chain", "title", "steps"],
+        "additionalProperties": False,
+    }
+
+    def handle(self, handler: ConnectionHandler) -> Result:
+        if denied := _require_lab_admin(handler):
+            return denied
+        if not _lab_mode_enabled():
+            return _finish(handler, 403, {"lab": False}, "Attack lab is disabled")
+
+        chain = handler.data["chain"]
+        title = handler.data["title"].strip()
+        steps = tuple(handler.data["steps"])
+        if not title:
+            return _finish(
+                handler,
+                400,
+                {"lab": True, "chain": chain},
+                "Teaching chain title cannot be blank",
+                target=chain,
+            )
+        if len(set(steps)) != len(steps):
+            return _finish(
+                handler,
+                400,
+                {"lab": True, "chain": chain},
+                "An exercise may appear only once in a chain",
+                target=chain,
+            )
+
+        requirements = frozenset(EXERCISE_FEATURES[step] for step in steps)
+        missing = sorted(requirements - _enabled_features())
+        if missing:
+            return _finish(
+                handler,
+                409,
+                {"lab": True, "chain": chain, "missing_features": missing},
+                "Enable every required vulnerability before publishing a chain",
+                target=chain,
+            )
+
+        with _state_lock:
+            _custom_chains[chain] = (title, steps)
+            _chain_progress[chain] = 0
+        return _finish(
+            handler,
+            200,
+            {
+                "lab": True,
+                "chain": chain,
+                "title": title,
+                "steps": list(steps),
+                "required_features": sorted(requirements),
+            },
+            "Custom teaching chain published",
+            target=chain,
         )
 
 
@@ -593,13 +802,8 @@ class RequestLabChainStepHandler(RequestHandler):
     schema = {
         "type": "object",
         "properties": {
-            "chain": {"type": "string", "enum": list(CHAIN_STEPS)},
-            "step": {
-                "type": "string",
-                "enum": sorted(
-                    {step for steps in CHAIN_STEPS.values() for step in steps}
-                ),
-            },
+            "chain": {"type": "string", "minLength": 1, "maxLength": 47},
+            "step": {"type": "string", "minLength": 1, "maxLength": 40},
             "evidence": {"type": "string", "maxLength": 128},
         },
         "required": ["chain", "step"],
@@ -617,7 +821,16 @@ class RequestLabChainStepHandler(RequestHandler):
                 "Required vulnerability gates for this chain are disabled",
                 target=chain,
             )
-        steps = CHAIN_STEPS[chain]
+        definition = _chain_definition(chain)
+        if definition is None:
+            return _finish(
+                handler,
+                404,
+                {"lab": True, "chain": chain},
+                "Teaching chain was not found",
+                target=chain,
+            )
+        _title, steps = definition
         if step not in steps:
             return _finish(
                 handler,
@@ -631,7 +844,7 @@ class RequestLabChainStepHandler(RequestHandler):
         error_data = None
         error_message = None
         with _state_lock:
-            progress = _chain_progress[chain]
+            progress = _chain_progress.setdefault(chain, 0)
             if index > progress:
                 error_data = {"lab": True, "expected_step": steps[progress]}
                 error_message = "Attack chain step is out of order"
@@ -673,7 +886,7 @@ class RequestLabChainStepHandler(RequestHandler):
                 "completed": completed,
                 "replayed": replayed,
                 "evidence": evidence,
-                "exercise": CHAIN_EXERCISES[(chain, step)],
+                "exercise": EXERCISES[step],
                 "honeytoken": alert is not None,
                 "alert": alert,
             },
@@ -684,8 +897,15 @@ class RequestLabChainStepHandler(RequestHandler):
 
 @hookimpl
 def ext_register_handlers() -> dict[str, type[RequestHandler]]:
-    features = _enabled_features()
-    handlers: dict[str, type[RequestHandler]] = {}
+    if not _lab_mode_enabled():
+        return {}
+    handlers: dict[str, type[RequestHandler]] = {
+        "reset_lab": RequestResetLabHandler,
+        "lab_status": RequestLabStatusHandler,
+        "lab_set_vulnerability": RequestLabSetVulnerabilityHandler,
+        "lab_configure_chain": RequestLabConfigureChainHandler,
+        "lab_chain_step": RequestLabChainStepHandler,
+    }
     feature_handlers = {
         "sqli": ("lab_sqli", RequestLabSQLiHandler),
         "rce": ("lab_rce", RequestLabRCEHandler),
@@ -693,28 +913,22 @@ def ext_register_handlers() -> dict[str, type[RequestHandler]]:
         "path_traversal": ("lab_path_traversal", RequestLabPathTraversalHandler),
         "idor": ("lab_idor", RequestLabIDORHandler),
     }
-    for feature in features:
+    for feature in FEATURE_ENV:
         action, handler = feature_handlers[feature]
         handlers[action] = handler
-
-    if features:
-        handlers["reset_lab"] = RequestResetLabHandler
-        handlers["lab_status"] = RequestLabStatusHandler
-    if any(requirements <= features for requirements in CHAIN_REQUIREMENTS.values()):
-        handlers["lab_chain_step"] = RequestLabChainStepHandler
     return handlers
 
 
 @hookimpl
 def ext_register_extension_flags() -> set[str]:
-    features = _enabled_features()
-    if not features:
+    if not _lab_mode_enabled():
         return set()
+    features = _enabled_features()
     flags = {"thesis_attack_lab"}
     flags.update(f"lab_vuln_{feature}" for feature in features)
     flags.update(
-        f"lab_chain_{chain}"
-        for chain, requirements in CHAIN_REQUIREMENTS.items()
-        if requirements <= features
+        f"lab_chain_{chain['id']}"
+        for chain in _chain_snapshot()
+        if chain["available"]
     )
     return flags

@@ -77,6 +77,10 @@ def disabled_clean_lab(monkeypatch, lab):
     monkeypatch.delenv("LAB_MODE", raising=False)
     for env_name in FEATURE_ENV.values():
         monkeypatch.delenv(env_name, raising=False)
+    with lab._state_lock:
+        lab._runtime_feature_overrides.clear()
+        lab._custom_chains.clear()
+        lab._chain_progress = {name: 0 for name in lab.CHAIN_STEPS}
     lab._reset_lab_state()
 
 
@@ -154,9 +158,13 @@ def test_real_extension_manager_loads_new_directory_entrypoint(
     )
     previous = sys.modules.pop("thesis_attack_lab", None)
     try:
-        extension_manager.load_extensions_from_directory(extension_root)
+        shutil.copytree(Path(extension_manager.__file__).parent / "builtin", extension_root / "builtin")
+        from include.config.settings import global_config
+        extension_manager.load_extensions_from_directory(
+            extension_root, ("thesis_attack_lab",), config=global_config
+        )
         assert plugin_manager.has_plugin("thesis_attack_lab")
-        assert plugin_manager.hook.ext_register_handlers() == [{}]
+        assert lab.ext_register_handlers() == {}
     finally:
         sys.modules.pop("thesis_attack_lab", None)
         if previous is not None:
@@ -398,7 +406,14 @@ def test_identity_attack_chain_is_ordered_and_resettable(monkeypatch, lab):
 
 def test_sandbox_attack_chain_requires_traversal_and_rce_gates(monkeypatch, lab):
     enable(monkeypatch, lab, "path_traversal")
-    assert "lab_chain_step" not in lab.ext_register_handlers()
+    assert "lab_chain_step" in lab.ext_register_handlers()
+
+    blocked, _ = call(
+        lab,
+        lab.RequestLabChainStepHandler,
+        {"chain": "sandbox_breach", "step": "traverse"},
+    )
+    assert blocked.code == 403
 
     enable(monkeypatch, lab, "path_traversal", "rce")
     assert "lab_chain_step" in lab.ext_register_handlers()
@@ -413,6 +428,80 @@ def test_sandbox_attack_chain_requires_traversal_and_rce_gates(monkeypatch, lab)
         lab.RequestLabChainStepHandler,
         {
             "chain": "sandbox_breach",
+            "step": "execute",
+            "evidence": first.data["evidence"],
+        },
+    )
+    assert final.code == 200
+    assert final.data["completed"] is True
+    assert final.data["exercise"]["action"] == "lab_rce"
+
+
+def test_sysop_can_hot_switch_lab_features_without_restart(monkeypatch, lab):
+    monkeypatch.setenv("LAB_MODE", "true")
+    monkeypatch.setattr(lab, "_is_sysop", lambda username: username == "teacher")
+
+    enabled, _ = call(
+        lab,
+        lab.RequestLabSetVulnerabilityHandler,
+        {"feature": "sqli", "enabled": True},
+        username="teacher",
+    )
+    assert enabled.code == 200
+    assert lab.RequestLabSQLiHandler().handle(
+        FakeConnectionHandler({"query": "lab-alice", "dataset": "LAB_USERS"})
+    ).code == 200
+
+    disabled, _ = call(
+        lab,
+        lab.RequestLabSetVulnerabilityHandler,
+        {"feature": "sqli", "enabled": False},
+        username="teacher",
+    )
+    assert disabled.code == 200
+    assert lab.RequestLabSQLiHandler().handle(
+        FakeConnectionHandler({"query": "lab-alice", "dataset": "LAB_USERS"})
+    ).code == 403
+
+
+def test_sysop_can_publish_an_ordered_custom_teaching_chain(monkeypatch, lab):
+    enable(monkeypatch, lab, "sqli", "rce")
+    monkeypatch.setattr(lab, "_is_sysop", lambda username: username == "teacher")
+
+    denied, _ = call(
+        lab,
+        lab.RequestLabConfigureChainHandler,
+        {
+            "chain": "custom-demo",
+            "title": "自定义演练",
+            "steps": ["enumerate", "execute"],
+        },
+        username="student",
+    )
+    assert denied.code == 403
+
+    published, _ = call(
+        lab,
+        lab.RequestLabConfigureChainHandler,
+        {
+            "chain": "custom-demo",
+            "title": "自定义演练",
+            "steps": ["enumerate", "execute"],
+        },
+        username="teacher",
+    )
+    assert published.code == 200
+
+    first, _ = call(
+        lab,
+        lab.RequestLabChainStepHandler,
+        {"chain": "custom-demo", "step": "enumerate"},
+    )
+    final, _ = call(
+        lab,
+        lab.RequestLabChainStepHandler,
+        {
+            "chain": "custom-demo",
             "step": "execute",
             "evidence": first.data["evidence"],
         },
