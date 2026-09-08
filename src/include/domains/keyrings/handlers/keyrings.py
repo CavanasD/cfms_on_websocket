@@ -14,23 +14,55 @@ Security constraints enforced by these handlers:
 """
 
 __all__ = [
-    "RequestUploadUserKeyHandler",
-    "RequestGetUserKeyHandler",
     "RequestDeleteUserKeyHandler",
-    "RequestSetPreferenceDEKHandler",
+    "RequestGetUserKeyHandler",
     "RequestListUserKeysHandler",
+    "RequestSetPreferenceDEKHandler",
+    "RequestUploadUserKeyHandler",
 ]
 
 import time
+from typing import Annotated
+
+from pydantic import StringConstraints
 
 from include.database.models.identity import User
 from include.database.models.keyrings import UserKey
 from include.database.session import Session
 from include.domains.access.permissions import Permissions
-from include.domains.pagination import OFFSET_PAGINATION_SCHEMA, get_offset_pagination
+from include.domains.pagination import (
+    PaginationOffset,
+    PaginationPageSize,
+    get_offset_pagination,
+)
 from include.messages import Messages as smsg
 from include.transport.connection import ConnectionHandler
-from include.transport.request_handler import RequestHandler, Result
+from include.transport.request_handler import (
+    REQUEST_UNSET,
+    Omittable,
+    RequestDataModel,
+    RequestHandler,
+    Result,
+)
+from include.types import NonEmptyString
+
+_KeyContent = Annotated[str, StringConstraints(min_length=1, max_length=512)]
+
+
+class _UploadUserKeyRequest(RequestDataModel):
+    content: _KeyContent
+    label: Omittable[str] = REQUEST_UNSET
+    target_username: Omittable[NonEmptyString] = REQUEST_UNSET
+
+
+class _KeyIDRequest(RequestDataModel):
+    id: NonEmptyString
+
+
+class _ListUserKeysRequest(RequestDataModel):
+    target_username: Omittable[NonEmptyString] = REQUEST_UNSET
+    offset: Omittable[PaginationOffset] = REQUEST_UNSET
+    count: Omittable[PaginationPageSize] = REQUEST_UNSET
 
 
 class RequestUploadUserKeyHandler(RequestHandler):
@@ -52,18 +84,10 @@ class RequestUploadUserKeyHandler(RequestHandler):
         404 - User does not exist (admin path only).
     """
 
-    schema = {
-        "type": "object",
-        "properties": {
-            "content": {"type": "string", "minLength": 1, "maxLength": 512},
-            "label": {"type": "string"},
-            "target_username": {"type": "string", "minLength": 1},
-        },
-        "required": ["content"],
-        "additionalProperties": False,
-    }
+    request_model = _UploadUserKeyRequest
 
     require_auth = True
+    rate_limit_cost = 2
 
     def handle(self, handler: ConnectionHandler):
         key_content: str = handler.data["content"]
@@ -123,16 +147,10 @@ class RequestGetUserKeyHandler(RequestHandler):
         404 - Key not found.
     """
 
-    schema = {
-        "type": "object",
-        "properties": {
-            "id": {"type": "string", "minLength": 1},
-        },
-        "required": ["id"],
-        "additionalProperties": False,
-    }
+    request_model = _KeyIDRequest
 
     require_auth = True
+    rate_limit_cost = 1
 
     def handle(self, handler: ConnectionHandler):
         key_id: str = handler.data["id"]
@@ -147,10 +165,12 @@ class RequestGetUserKeyHandler(RequestHandler):
 
             # Authorisation: the key must belong to the requesting user, or the
             # user must have admin-level manage_keyrings permission.
-            if key.username != handler.username:
-                if Permissions.MANAGE_KEYRINGS not in this_user.all_permissions:
-                    handler.conclude_request(403, {}, smsg.PERMISSION_DENIED)
-                    return Result(code=403, target=key_id, username=handler.username)
+            if (
+                key.username != handler.username
+                and Permissions.MANAGE_KEYRINGS not in this_user.all_permissions
+            ):
+                handler.conclude_request(403, {}, smsg.PERMISSION_DENIED)
+                return Result(code=403, target=key_id, username=handler.username)
 
             handler.conclude_request(
                 200,
@@ -182,16 +202,10 @@ class RequestDeleteUserKeyHandler(RequestHandler):
         404 - Key not found.
     """
 
-    schema = {
-        "type": "object",
-        "properties": {
-            "id": {"type": "string", "minLength": 1},
-        },
-        "required": ["id"],
-        "additionalProperties": False,
-    }
+    request_model = _KeyIDRequest
 
     require_auth = True
+    rate_limit_cost = 2
 
     def handle(self, handler: ConnectionHandler):
         key_id: str = handler.data["id"]
@@ -204,10 +218,12 @@ class RequestDeleteUserKeyHandler(RequestHandler):
                 handler.conclude_request(404, {}, smsg.KEY_NOT_FOUND)
                 return Result(code=404, target=key_id, username=handler.username)
 
-            if key.username != handler.username:
-                if Permissions.MANAGE_KEYRINGS not in this_user.all_permissions:
-                    handler.conclude_request(403, {}, smsg.PERMISSION_DENIED)
-                    return Result(code=403, target=key_id, username=handler.username)
+            if (
+                key.username != handler.username
+                and Permissions.MANAGE_KEYRINGS not in this_user.all_permissions
+            ):
+                handler.conclude_request(403, {}, smsg.PERMISSION_DENIED)
+                return Result(code=403, target=key_id, username=handler.username)
 
             # If this key is set as the owner's preference DEK, clear it before deletion
             owner_user = session.get(User, key.username)
@@ -240,16 +256,10 @@ class RequestSetPreferenceDEKHandler(RequestHandler):
         404 - Key not found.
     """
 
-    schema = {
-        "type": "object",
-        "properties": {
-            "id": {"type": "string", "minLength": 1},
-        },
-        "required": ["id"],
-        "additionalProperties": False,
-    }
+    request_model = _KeyIDRequest
 
     require_auth = True
+    rate_limit_cost = 2
 
     def handle(self, handler: ConnectionHandler):
         key_id: str = handler.data["id"]
@@ -262,10 +272,12 @@ class RequestSetPreferenceDEKHandler(RequestHandler):
                 handler.conclude_request(404, {}, smsg.KEY_NOT_FOUND)
                 return Result(code=404, target=key_id, username=handler.username)
 
-            if key.username != handler.username:
-                if Permissions.MANAGE_KEYRINGS not in this_user.all_permissions:
-                    handler.conclude_request(403, {}, smsg.PERMISSION_DENIED)
-                    return Result(code=403, target=key_id, username=handler.username)
+            if (
+                key.username != handler.username
+                and Permissions.MANAGE_KEYRINGS not in this_user.all_permissions
+            ):
+                handler.conclude_request(403, {}, smsg.PERMISSION_DENIED)
+                return Result(code=403, target=key_id, username=handler.username)
 
             key_owner = User.get_existing(session, key.username)
             key_owner.preference_dek = key
@@ -292,16 +304,10 @@ class RequestListUserKeysHandler(RequestHandler):
         404 - User does not exist (admin path only).
     """
 
-    schema = {
-        "type": "object",
-        "properties": {
-            "target_username": {"type": "string", "minLength": 1},
-            **OFFSET_PAGINATION_SCHEMA,
-        },
-        "additionalProperties": False,
-    }
+    request_model = _ListUserKeysRequest
 
     require_auth = True
+    rate_limit_cost = 2
 
     def handle(self, handler: ConnectionHandler):
         target_username: str = handler.data.get("target_username") or handler.username
@@ -311,12 +317,14 @@ class RequestListUserKeysHandler(RequestHandler):
             target_user = session.get(User, target_username)
             operator = User.get_existing(session, handler.username)
 
-            if target_username != handler.username:
-                if Permissions.MANAGE_KEYRINGS not in operator.all_permissions:
-                    handler.conclude_request(403, {}, smsg.PERMISSION_DENIED)
-                    return Result(
-                        code=403, target=target_username, username=handler.username
-                    )
+            if (
+                target_username != handler.username
+                and Permissions.MANAGE_KEYRINGS not in operator.all_permissions
+            ):
+                handler.conclude_request(403, {}, smsg.PERMISSION_DENIED)
+                return Result(
+                    code=403, target=target_username, username=handler.username
+                )
 
             if not target_user:
                 handler.conclude_request(404, {}, smsg.USER_DOES_NOT_EXIST)

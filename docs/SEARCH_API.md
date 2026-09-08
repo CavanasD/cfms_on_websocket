@@ -2,15 +2,16 @@
 
 ## Overview
 
-The Search API searches documents and directories by name. Results are filtered
-by the authenticated user's read access, sorted deterministically, and returned
-with cursor pagination.
+The Search API searches documents and directories by name. The authenticated
+user must have the `search` permission, either directly or through a group.
+Results are then filtered by the user's read access, sorted deterministically,
+and returned with cursor pagination.
 
 ## Endpoint
 
 **Action:** `search`
 
-**Authentication:** Required
+**Authentication:** Required, with the `search` permission
 
 ## Request Format
 
@@ -35,7 +36,7 @@ with cursor pagination.
 
 | Parameter | Type | Required | Default | Description |
 |-----------|------|----------|---------|-------------|
-| `query` | string | Yes | - | Case-insensitive partial match term. Whitespace-only queries are rejected. |
+| `query` | string | Yes | - | Case-insensitive literal partial match term. Whitespace-only queries are rejected. |
 | `page_size` | integer | No | 128 | Maximum number of items to return. Range: 1-128. |
 | `cursor` | string/null | No | null | Encrypted cursor returned by the previous page. Omit or use null for the first page. |
 | `sort_by` | string | No | `name` | One of `name`, `created_time`, `size`, `last_modified`. |
@@ -108,13 +109,17 @@ previous response's `next_cursor`.
 |------|-------------|
 | 400 | Invalid query, invalid sort parameter, invalid page size, or invalid cursor. |
 | 401 | Authentication required. |
-| 403 | Invalid user/token or access denied. |
+| 403 | The authenticated user does not have the `search` permission. |
 
 ## Notes
 
-- Permission filtering is applied before pagination, but broad queries may stop
-  early at a server-side scan window. In that case the response can contain
-  fewer than `page_size` items while still returning `has_more: true` and a
-  `next_cursor`.
+- Search terms are matched literally. Characters with special meaning in SQL
+  patterns, including `%` and `_`, do not act as wildcards; `/`, quotes, and
+  other punctuation are also matched as ordinary characters.
+- The global `search` permission controls whether a user may invoke this API.
+  Read rules, inherited rules, object access entries, and user blocks then
+  determine which matching objects appear in the response.
+- Permission filtering is applied before pagination, so page boundaries and
+  `has_more` are calculated from visible candidates.
 - Documents without active revisions are excluded.
 - Empty results return `items: []`, `has_more: false`, and `next_cursor: null`.

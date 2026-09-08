@@ -1,5 +1,9 @@
 __all__ = ["RequestGrantAccessHandler", "RequestRevokeAccessHandler"]
 
+from typing import Annotated, Literal
+
+from pydantic import Field
+
 from include.database.models.access import ObjectAccessEntry
 from include.database.models.documents import (
     Document,
@@ -10,57 +14,57 @@ from include.database.models.identity import (
     UserGroup,
 )
 from include.database.session import Session
+from include.domains.access.authorization.evaluation import check_access_requirements
 from include.domains.access.permissions import Permissions
 from include.domains.pagination import (
-    CURSOR_PAGINATION_SCHEMA,
     CursorError,
     PaginationCursor,
+    PaginationCursorToken,
+    PaginationPageSize,
     get_page_size,
     make_cursor_response,
 )
 from include.messages import Messages as smsg
 from include.transport.connection import ConnectionHandler
-from include.transport.request_handler import RequestHandler, Result
+from include.transport.request_handler import (
+    REQUEST_UNSET,
+    Omittable,
+    RequestDataModel,
+    RequestHandler,
+    Result,
+)
+from include.types import JsonInteger, NonEmptyString, NonNegativeFloat
 
 ENTITY_TYPE_MAPPING = {"user": User, "group": UserGroup}
 TARGET_TYPE_MAPPING = {"document": Document, "directory": Folder}
 
 
+class _GrantAccessRequest(RequestDataModel):
+    entity_type: Literal["user", "group"]
+    entity_identifier: NonEmptyString
+    target_type: Literal["document", "directory"]
+    target_identifier: NonEmptyString
+    access_types: list[str]
+    start_time: NonNegativeFloat
+    end_time: Omittable[NonNegativeFloat] = REQUEST_UNSET
+
+
+class _ViewAccessEntriesRequest(RequestDataModel):
+    object_type: Literal["user", "group", "document", "directory"]
+    object_identifier: NonEmptyString
+    page_size: Omittable[PaginationPageSize] = REQUEST_UNSET
+    cursor: PaginationCursorToken | None = None
+
+
+class _RevokeAccessRequest(RequestDataModel):
+    entry_id: Annotated[JsonInteger, Field(ge=1)]
+
+
 class RequestGrantAccessHandler(RequestHandler):
-    schema = {
-        "type": "object",
-        "properties": {
-            "entity_type": {
-                "type": "string",
-                "minLength": 1,
-                "pattern": "^(user|group)$",
-            },
-            "entity_identifier": {"type": "string", "minLength": 1},
-            "target_type": {
-                "type": "string",
-                "minLength": 1,
-                "pattern": "^(document|directory)$",
-            },
-            "target_identifier": {"type": "string", "minLength": 1},
-            "access_types": {"type": "array", "items": {"type": "string"}},
-            "start_time": {
-                "type": "number",
-                "minimum": 0,
-            },
-            "end_time": {"type": "number", "minimum": 0},
-        },
-        "required": [
-            "entity_type",
-            "entity_identifier",
-            "target_type",
-            "target_identifier",
-            "access_types",
-            "start_time",
-        ],
-        "additionalProperties": False,
-    }
+    request_model = _GrantAccessRequest
 
     require_auth = True
+    rate_limit_cost = 3
 
     def handle(self, handler: ConnectionHandler):
 
@@ -108,7 +112,9 @@ class RequestGrantAccessHandler(RequestHandler):
                 )
 
             for access_type in access_types:
-                if not target.check_access_requirements(operator, access_type):
+                if not check_access_requirements(
+                    session, operator, target, access_type
+                ):
                     handler.conclude_request(403, {}, smsg.ACCESS_DENIED)
                     return Result(
                         code=403,
@@ -137,25 +143,10 @@ class RequestGrantAccessHandler(RequestHandler):
 
 
 class RequestViewAccessEntriesHandler(RequestHandler):
-    schema = {
-        "type": "object",
-        "properties": {
-            "object_type": {
-                "type": "string",
-                "minLength": 1,
-                "pattern": "^(user|group|document|directory)$",
-            },
-            "object_identifier": {"type": "string", "minLength": 1},
-            **CURSOR_PAGINATION_SCHEMA,
-        },
-        "required": [
-            "object_type",
-            "object_identifier",
-        ],
-        "additionalProperties": False,
-    }
+    request_model = _ViewAccessEntriesRequest
 
     require_auth = True
+    rate_limit_cost = 3
 
     def handle(self, handler: ConnectionHandler):
         object_type: str = handler.data["object_type"]
@@ -247,19 +238,10 @@ class RequestViewAccessEntriesHandler(RequestHandler):
 
 
 class RequestRevokeAccessHandler(RequestHandler):
-    schema = {
-        "type": "object",
-        "properties": {
-            "entry_id": {
-                "type": "integer",
-                "minimum": 1,
-            },
-        },
-        "required": ["entry_id"],
-        "additionalProperties": False,
-    }
+    request_model = _RevokeAccessRequest
 
     require_auth = True
+    rate_limit_cost = 2
 
     def handle(self, handler: ConnectionHandler):
         entry_id: int = handler.data["entry_id"]

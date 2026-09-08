@@ -1,6 +1,36 @@
 # Enable debug mode for verbose logging and additional debugging features
 debug = false
 
+[extensions]
+# Extension identifiers to load, in registration order. Changes require a restart.
+# Add "scheduling" only to expose schedule query and configuration actions.
+enabled = []
+
+# Automatically enter lockdown after a service-wide burst of failed local
+# password or TOTP authentication attempts.
+[extensions.brute_force_lockdown]
+window_seconds = 600
+failure_threshold = 50
+distinct_account_threshold = 10
+distinct_ip_threshold = 10
+reason = "Automatic security lockdown: suspected credential-guessing attack detected."
+
+# Optional HTTPS API framework for extension-owned APIRouter registrations.
+# Install with `uv sync --extra ext_http_api` and add "http_api" to enabled.
+# All settings in this table require a server restart to take effect.
+[extensions.http_api]
+host = "localhost"
+port = 5105
+# Omit both values to reuse server.ssl_certfile and server.ssl_keyfile.
+# ssl_certfile = "./content/ssl/http-cert.pem"
+# ssl_keyfile = "./content/ssl/http-key.pem"
+max_concurrency = 64  # Exact number of simultaneous HTTP connections admitted.
+max_request_body_bytes = 1048576  # Hard raw-body limit, including streamed bodies.
+startup_timeout_seconds = 10.0
+shutdown_timeout_seconds = 10.0
+cors_allowed_origins = []
+docs_enabled = false
+
 [server]
 # Name of the server
 name = "CFMS WebSocket Server"
@@ -16,17 +46,23 @@ secret_key = ""
 ssl_keyfile = "./content/ssl/key.pem"
 # Path to the SSL/TLS certificate file
 ssl_certfile = "./content/ssl/cert.pem"
+# Reverse proxies allowed to supply X-Forwarded-For or X-Real-IP.
+trusted_proxy_networks = ["127.0.0.1/32", "::1/128"]
 
-# File chunk size for uploads (default is 2MB)
+# Server-side chunk-size limit for uploads and downloads (default is 2MB)
 file_chunk_size = 2097152 # 2MB
 # Setting the chunk size too high may cause transfer failures depending on client configuration
 
-[document]
-# Whether to allow multiple documents with the same name in the same directory.
-# 
-# If set to false after previously being true, existing duplicate documents will be kept,
-# but new uploads with duplicate names will be rejected.
-allow_name_duplicate = false
+[server.admission_control]
+# Hard per-process resource ceilings. These remain enforced even while request
+# rate control is disabled or observing.
+max_connections = 64
+max_connections_per_ip = 16
+# Keep below database.pool total capacity to leave room for background work.
+max_inflight_requests = 12
+max_inflight_requests_per_connection = 8
+max_pending_streams_per_connection = 16
+busy_retry_after_seconds = 1
 
 [security]
 # Pepper used for password hashing
@@ -61,9 +97,41 @@ require_client_cert = false
 # Only takes effect when require_client_cert is true.
 client_cert_ca_path = "./content/ssl/client/"
 
+[security.auth_throttle]
+# Failed authentication throttling. Missing settings use these defaults.
+enabled = true
+account_failure_threshold = 5
+account_base_delay_seconds = 30
+account_max_delay_seconds = 3600
+account_reset_seconds = 86400
+account_ip_failure_threshold = 5
+account_ip_window_seconds = 900
+account_ip_block_seconds = 900
+ip_failure_threshold = 60
+ip_window_seconds = 600
+ip_block_seconds = 900
+record_retention_days = 7
+
+[security.request_rate_control]
+# Start in observation mode, then calibrate with production telemetry before
+# switching to "enforce". "disabled" skips token-bucket accounting.
+mode = "observe"
+connection_capacity = 20
+connection_refill_tokens = 60
+connection_refill_period_seconds = 60
+request_refill_period_seconds = 60
+account_capacity = 120
+account_refill_tokens = 120
+ip_capacity = 600
+ip_refill_tokens = 600
+state_retention_seconds = 600
+
+[security.request_rate_control.action_costs]
+# Optional positive integer costs keyed by request action. Unlisted actions use
+# calibrated handler defaults in the 1, 2, 3, 5, 10, and 20 cost tiers. Values
+# here override those defaults. See docs/REQUEST_RATE_CONTROL.md for the matrix.
+
 [sso.oidc]
-# Enable OpenID Connect single sign-on.
-enabled = false
 # Issuer URL of the OpenID Provider, without a trailing slash.
 issuer = ""
 # OAuth/OIDC client credentials registered with the provider.
@@ -78,6 +146,35 @@ auto_provision = false
 # Groups assigned to auto-provisioned users.
 default_groups = ["user"]
 
+[identity.permission_retention]
+# Expired direct-user and group permission entries remain visible for this many days.
+retention_days = 30
+# Run one bounded background cleanup pass at this interval.
+cleanup_interval_seconds = 3600
+# Maximum entries removed from each permission table per background pass.
+batch_size = 500
+
+[maintenance.audit_retention]
+# Default age threshold used by manual audit maintenance commands.
+retention_days = 365
+# Maximum archived audit entries deleted in each transaction.
+batch_size = 500
+
+[scheduling]
+# Runtime settings for the always-on scheduling core.
+# Worker threads started by each server instance for either scheduling Provider.
+# Required when provider.scheduling = "redis". Use one stable value on every
+# node in a deployment and a different value for deployments sharing Redis.
+# redis_namespace = "replace-with-deployment-id"
+worker_threads = 4
+poll_interval_seconds = 1.0
+execution_lease_seconds = 60
+lease_refresh_seconds = 20
+shutdown_grace_seconds = 30
+misfire_grace_seconds = 300
+history_retention_days = 90
+claim_batch_size = 100
+
 [access]
 # Enable recursive access checks.
 # When enabled, access rules will be checked for the requested object itself, 
@@ -86,23 +183,93 @@ default_groups = ["user"]
 # Alternatively, you can disable this and ensure access rules are set correctly on every directory.
 enable_access_recursive_check = true
 
+[document.upload]
+# Time allowed to begin an upload after its task is created.
+start_timeout_seconds = 3600
+# Hard deadline applied after an upload starts.
+max_duration_seconds = 86400
+# Abort an upload when no frame arrives within this interval.
+idle_timeout_seconds = 300
+# Interval for the hidden abandoned-upload and creation-risk cleanup schedules.
+cleanup_interval_seconds = 60
+# Maximum number of empty, not-yet-uploaded documents per creator.
+max_pending_documents_per_creator = 16
+
+[document.upload.creation_risk_control]
+# Adaptive document-creation risk control. Use "observe" to log decisions without
+# enforcing rate denials. Pending-document limits are always enforced.
+mode = "enforce"
+refill_period_seconds = 600
+account_capacity = 60
+account_refill_tokens = 300
+ip_capacity = 200
+ip_refill_tokens = 1000
+new_account_seconds = 604800
+pending_elevated_ratio = 0.5
+pending_high_ratio = 0.75
+ip_account_window_seconds = 600
+ip_accounts_elevated = 4
+ip_accounts_high = 10
+denial_window_seconds = 600
+denials_elevated = 1
+denials_high = 3
+elevated_cost = 3
+high_cost = 10
+state_retention_seconds = 86400
+
+[document.download.risk_control]
+# Download limits start in observation mode. Shadow decisions are logged but do
+# not reject task issuance or transfer starts until mode is changed to "enforce".
+mode = "observe"
+refill_period_seconds = 600
+issue_account_capacity = 60
+issue_account_refill_tokens = 300
+issue_ip_capacity = 200
+issue_ip_refill_tokens = 1000
+transfer_account_capacity = 60
+transfer_account_refill_tokens = 300
+transfer_ip_capacity = 200
+transfer_ip_refill_tokens = 1000
+# A single bearer task may start five times immediately and refills ten starts
+# over its one-hour lifetime.
+task_capacity = 5
+task_refill_tokens = 10
+task_refill_period_seconds = 3600
+new_account_seconds = 604800
+ip_account_window_seconds = 600
+ip_accounts_elevated = 4
+ip_accounts_high = 10
+denial_window_seconds = 600
+denials_elevated = 1
+denials_high = 3
+elevated_cost = 3
+high_cost = 10
+state_retention_seconds = 86400
+
 [database]
-# Database type to use ("sqlite" or "mysql")
+# Database type to use ("sqlite", "mysql", or "postgresql")
 type = "sqlite"
 
 # Specify the database file name if using SQLite
 file = "app.db"
 
-# Specify connection properties if using MySQL
+# Specify connection properties if using MySQL or PostgreSQL
 host = "localhost"
-port = 3306
+port = 3306 # Use 5432 for PostgreSQL
 username = ""
 password = ""
-# Specify the database name if using MySQL
+# Specify the database name if using MySQL or PostgreSQL
 name = "app_db"
 # Specify the character set if using MySQL
 charset = "utf8mb4"
 options = "" # Not implemented yet
+
+# QueuePool settings for file-based SQLite, MySQL, and PostgreSQL. Changes
+# require a server restart. In-memory SQLite keeps its dedicated pool behavior.
+[database.pool]
+size = 5
+max_overflow = 10
+timeout_seconds = 30
 
 [provider]
 # Caching provider ("memory" or "redis")
@@ -111,6 +278,10 @@ caching = "memory" # "memory" or "redis"
 storage = "local" # "local" or "s3"
 # Event bus provider ("local" or "redis")
 event_bus = "local" # "local" or "redis"
+# Request rate-limit state provider ("memory" or "redis")
+rate_limit = "memory" # "memory" or "redis"
+# Scheduled-task runtime ("local" or "redis")
+scheduling = "local"
 
 [redis]
 # Redis server host
@@ -149,5 +320,11 @@ endpoint_url = ""
 access_key_id = ""
 # S3 Secret Access Key
 secret_access_key = ""
+# S3 session token for temporary explicit credentials (optional)
+session_token = ""
 # S3 region name (e.g., "us-east-1")
 region_name = ""
+# S3 addressing style ("auto", "virtual", or "path")
+addressing_style = "auto"
+# Number of reusable HTTP connections; defaults to server admission capacity
+max_pool_connections = 64

@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 import base64
 import binascii
 import contextlib
@@ -25,11 +23,13 @@ import tomlkit
 from cryptography.exceptions import InvalidTag
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from rich.progress import Progress, TaskID
-from sqlalchemy import DateTime, Table, exists, func, insert, select, update
+from sqlalchemy import DateTime, Table, exists, func, insert, or_, select, update
 from sqlalchemy.engine import Engine
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import sessionmaker
 
-from include.config.constants import CORE_VERSION, ROOT_ABSPATH
+from include.config.constants import CORE_VERSION
+from include.config.paths import EXECUTABLE_ABSPATH
 from include.config.settings import global_config
 from include.database.models.access import (
     CompiledAccessRule,
@@ -64,8 +64,11 @@ from include.database.session import Base, Session, engine
 from include.domains.access.authorization.compiled_rules import (
     compile_access_rule,
 )
+from include.domains.documents.commands.name_conflicts import is_node_name_conflict
+from include.domains.operations.comments import CommentStore
 from include.providers.base import StorageProvider
 from include.providers.manager import ProviderManager
+from maintenance.database_tables import DEFERRED_COLUMNS, DEFERRED_UPDATE_ORDER
 
 _MODEL_IMPORTS = (
     UserBlockEntry,
@@ -110,6 +113,7 @@ HUMAN_KEY_SEPARATOR = "-"
 
 BACKUP_TABLE_NAMES = (
     "files",
+    "comments",
     "users",
     "user_groups",
     "group_permissions",
@@ -132,18 +136,26 @@ BACKUP_TABLE_NAMES = (
     "userblock_entries",
     "userblock_sub_entries",
     "banned_subnets",
+    "schedules",
 )
 
 EXCLUDED_TABLE_NAMES = frozenset(
     {
+        "account_throttles",
         "file_tasks",
         "login_throttles",
+        "rate_limit_buckets",
+        "risk_ip_accounts",
+        "schedule_executions",
+        "scheduling_runtime_state",
+        "system_states",
         "traffic_throttles",
     }
 )
 
 INSERT_ORDER = (
     "files",
+    "comments",
     "users",
     "user_groups",
     "group_permissions",
@@ -166,26 +178,11 @@ INSERT_ORDER = (
     "userblock_entries",
     "userblock_sub_entries",
     "banned_subnets",
-)
-
-DEFERRED_COLUMNS = {
-    "users": ("preference_dek_id",),
-    "folders": ("parent_id",),
-    "documents": ("current_revision_id",),
-    "document_revisions": ("parent_revision_id",),
-    "nodes": ("access_rule_set_id",),
-}
-
-DEFERRED_UPDATE_ORDER = (
-    ("users", "username", ("preference_dek_id",)),
-    ("folders", "id", ("parent_id",)),
-    ("document_revisions", "id", ("parent_revision_id",)),
-    ("documents", "id", ("current_revision_id",)),
-    ("nodes", "id", ("access_rule_set_id",)),
+    "schedules",
 )
 
 
-class BackupComponent(str, enum.Enum):
+class BackupComponent(enum.StrEnum):
     ACCOUNTS = "accounts"
     DOCUMENT_LIBRARY = "documents"
     AUDIT_LOG = "audit"
@@ -195,6 +192,7 @@ class BackupComponent(str, enum.Enum):
 
 BACKUP_COMPONENT_TABLES: dict[BackupComponent, tuple[str, ...]] = {
     BackupComponent.ACCOUNTS: (
+        "comments",
         "users",
         "user_groups",
         "group_permissions",
@@ -203,6 +201,7 @@ BACKUP_COMPONENT_TABLES: dict[BackupComponent, tuple[str, ...]] = {
         "keyrings",
         "userblock_entries",
         "userblock_sub_entries",
+        "schedules",
     ),
     BackupComponent.DOCUMENT_LIBRARY: (
         "nodes",
@@ -219,7 +218,7 @@ BACKUP_COMPONENT_TABLES: dict[BackupComponent, tuple[str, ...]] = {
         "compiled_access_rule_rights",
     ),
     BackupComponent.AUDIT_LOG: ("audit_entries",),
-    BackupComponent.BANNED_SUBNETS: ("banned_subnets",),
+    BackupComponent.BANNED_SUBNETS: ("comments", "banned_subnets"),
     BackupComponent.CONFIGURATION: (),
 }
 BACKUP_COMPONENT_DEPENDENCIES: dict[BackupComponent, tuple[BackupComponent, ...]] = {
@@ -431,7 +430,7 @@ def export_backup(
         total_steps=EXPORT_PROGRESS_STEPS,
         detail=str(output),
     )
-    created_at = dt.datetime.now(dt.timezone.utc).isoformat()
+    created_at = dt.datetime.now(dt.UTC).isoformat()
     nonce = secrets.token_bytes(GCM_NONCE_BYTES)
     header = BackupHeader(
         format_version=BACKUP_FORMAT_VERSION,
@@ -503,7 +502,7 @@ def import_backup(
     db_engine: Engine = engine,
     storage_provider: StorageProvider | None = None,
     config_path: str | os.PathLike[str] = "config.toml",
-    init_path: str | os.PathLike[str] = ROOT_ABSPATH / "init",
+    init_path: str | os.PathLike[str] = EXECUTABLE_ABSPATH / "init",
     progress: Progress | None = None,
     show_progress_details: bool = False,
 ) -> dict[str, Any]:
@@ -773,7 +772,7 @@ def _stage_backup_payload(
     manifest = {
         "format_version": BACKUP_FORMAT_VERSION,
         "core_version": str(CORE_VERSION),
-        "exported_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+        "exported_at": dt.datetime.now(dt.UTC).isoformat(),
         "components": sorted(component.value for component in components),
         "tables": table_export.manifest,
         "excluded_tables": sorted(EXCLUDED_TABLE_NAMES),
@@ -839,7 +838,10 @@ def _export_tables(
                 verbose_only=True,
             )
             table = metadata_tables[table_name]
-            columns = [column.name for column in table.columns]
+            stored_columns = [
+                column for column in table.columns if column.computed is None
+            ]
+            columns = [column.name for column in stored_columns]
             rows_path = tables_dir / f"{table_name}.jsonl"
             row_count = 0
             order_by = [column for column in table.primary_key.columns]
@@ -851,6 +853,7 @@ def _export_tables(
                     statement,
                     table,
                     table_name,
+                    metadata_tables,
                     components,
                     file_ids or frozenset(),
                 )
@@ -865,7 +868,7 @@ def _export_tables(
             with rows_path.open("wb") as f:
                 for row in connection.execute(statement).mappings():
                     encoded = {}
-                    for column in table.columns:
+                    for column in stored_columns:
                         value = row[column.name]
                         if (
                             table_name == "nodes"
@@ -873,7 +876,11 @@ def _export_tables(
                             and value not in active_compiled_rule_set_ids
                         ):
                             value = None
-                        encoded[str(column.name)] = _serialize_value(value)
+                        encoded[str(column.name)] = _serialize_table_value(
+                            table_name,
+                            column.name,
+                            value,
+                        )
                     f.write(orjson.dumps(encoded, option=orjson.OPT_SORT_KEYS))
                     f.write(b"\n")
                     row_count += 1
@@ -954,12 +961,14 @@ def _export_files(
 
         sha256 = hashlib.sha256()
         size = 0
-        with storage_provider.fopen(storage_path, "rb") as source:
-            with staged_file.open("wb") as target:
-                while chunk := source.read(1024 * 1024):
-                    sha256.update(chunk)
-                    size += len(chunk)
-                    target.write(chunk)
+        with (
+            storage_provider.fopen(storage_path, "rb") as source,
+            staged_file.open("wb") as target,
+        ):
+            while chunk := source.read(1024 * 1024):
+                sha256.update(chunk)
+                size += len(chunk)
+                target.write(chunk)
 
         file_manifest.append(
             {
@@ -1085,6 +1094,7 @@ def _apply_export_table_filter(
     statement,
     table: Table,
     table_name: str,
+    tables: dict[str, Table],
     components: frozenset[BackupComponent],
     file_ids: frozenset[str],
 ):
@@ -1097,6 +1107,35 @@ def _apply_export_table_filter(
         return statement.where(
             table.c.target_type.in_(sorted(DOCUMENT_ACCESS_TARGET_TYPES))
         )
+    if table_name == "comments":
+        reference_filters = []
+        if BackupComponent.ACCOUNTS in components:
+            users = tables["users"]
+            user_blocks = tables["userblock_entries"]
+            reference_filters.append(
+                table.c.comment_id.in_(
+                    select(users.c.status_comment_id).where(
+                        users.c.status_comment_id.is_not(None)
+                    )
+                )
+            )
+            reference_filters.append(
+                table.c.comment_id.in_(
+                    select(user_blocks.c.reason_comment_id).where(
+                        user_blocks.c.reason_comment_id.is_not(None)
+                    )
+                )
+            )
+        if BackupComponent.BANNED_SUBNETS in components:
+            banned_subnets = tables["banned_subnets"]
+            reference_filters.append(
+                table.c.comment_id.in_(
+                    select(banned_subnets.c.reason_comment_id).where(
+                        banned_subnets.c.reason_comment_id.is_not(None)
+                    )
+                )
+            )
+        return statement.where(or_(*reference_filters))
     return statement
 
 
@@ -1204,20 +1243,22 @@ def _write_compressed_payload(
         *((staged_file, f"files/{staged_file.name}") for staged_file in staged_files),
     ]
     total_members = len(archive_members)
-    with lzma.open(output_path, "wb", preset=6) as compressed:
-        with tarfile.open(fileobj=compressed, mode="w|") as tar:
-            for member_index, (source_path, archive_path) in enumerate(
-                archive_members,
-                start=1,
-            ):
-                _add_staged_file(
-                    tar,
-                    source_path,
-                    archive_path,
-                    progress_reporter=progress_reporter,
-                    member_index=member_index,
-                    total_members=total_members,
-                )
+    with (
+        lzma.open(output_path, "wb", preset=6) as compressed,
+        tarfile.open(fileobj=compressed, mode="w|") as tar,
+    ):
+        for member_index, (source_path, archive_path) in enumerate(
+            archive_members,
+            start=1,
+        ):
+            _add_staged_file(
+                tar,
+                source_path,
+                archive_path,
+                progress_reporter=progress_reporter,
+                member_index=member_index,
+                total_members=total_members,
+            )
     LOGGER.debug("Compressed payload created at %s", output_path)
 
 
@@ -1314,9 +1355,11 @@ def _restore_files(
         parent = os.path.dirname(storage_path)
         if parent:
             storage_provider.makedirs(parent, exist_ok=True)
-        with source_path.open("rb") as source:
-            with storage_provider.fopen(storage_path, "wb") as target:
-                shutil.copyfileobj(source, target, length=1024 * 1024)
+        with (
+            source_path.open("rb") as source,
+            storage_provider.fopen(storage_path, "wb") as target,
+        ):
+            shutil.copyfileobj(source, target, length=1024 * 1024)
         written_paths.append(storage_path)
         LOGGER.debug("Restored storage file %s", storage_path)
 
@@ -1336,14 +1379,27 @@ def _restore_database(
     compiled_rule_set_id_by_node = _build_missing_compiled_rule_set_mapping(
         extract_dir, manifest
     )
+    legacy_banned_subnet_reasons = _load_legacy_banned_subnet_reasons(
+        extract_dir, manifest
+    )
+    legacy_node_namespace = _load_legacy_node_namespace(extract_dir, manifest)
     deferred_updates: dict[str, list[dict[str, Any]]] = {
         table_name: [] for table_name in DEFERRED_COLUMNS if table_name in table_names
     }
 
     with session_factory.begin() as session:
         connection = session.connection()
-        _restore_legacy_nodes_if_needed(connection, extract_dir, manifest, tables)
+        restored_node_tables = _restore_node_tables(
+            connection,
+            extract_dir,
+            manifest,
+            tables,
+            deferred_updates,
+            legacy_node_namespace,
+        )
         for table_index, table_name in enumerate(table_names, start=1):
+            if table_name in restored_node_tables:
+                continue
             LOGGER.debug(
                 "Restoring table %s (%d/%d)",
                 table_name,
@@ -1363,6 +1419,13 @@ def _restore_database(
             )
             table = tables[table_name]
             rows = _load_table_rows(extract_dir, manifest, table)
+            if table_name == "banned_subnets" and legacy_banned_subnet_reasons:
+                for row in rows:
+                    reason = legacy_banned_subnet_reasons.get(row["subnet"])
+                    if reason is not None:
+                        row["reason_comment_id"] = CommentStore.get_or_create_id(
+                            session, reason
+                        )
             if table_name == "compiled_access_rules" and compiled_rule_set_id_by_node:
                 _restore_missing_compiled_rule_sets(
                     connection,
@@ -1388,7 +1451,14 @@ def _restore_database(
                         row[column_name] = None
                 insert_rows.append(row)
             if insert_rows:
-                connection.execute(insert(table), insert_rows)
+                try:
+                    connection.execute(insert(table), insert_rows)
+                except IntegrityError as exc:
+                    if table_name != "nodes" or not is_node_name_conflict(exc):
+                        raise
+                    raise BackupFormatError(
+                        "Backup contains active sibling nodes with duplicate names"
+                    ) from exc
             LOGGER.debug("Restored table %s with %d row(s)", table_name, len(rows))
 
         for table_name, pk_name, column_names in DEFERRED_UPDATE_ORDER:
@@ -1416,20 +1486,151 @@ def _restore_database(
             LOGGER.debug("Converted legacy JSON access rules during database restore")
 
 
-def _restore_legacy_nodes_if_needed(
+def _restore_node_tables(
     connection,
     extract_dir: Path,
     manifest: dict[str, Any],
     tables: Mapping[str, Table],
-) -> None:
-    if "nodes" in manifest.get("tables", {}):
-        return
+    deferred_updates: dict[str, list[dict[str, Any]]],
+    legacy_namespace: dict[str, dict[str, Any]],
+) -> set[str]:
+    table_names = manifest.get("tables", {})
+    node_table_names = {"nodes", "folders", "documents"} & set(table_names)
+    if not node_table_names:
+        return set()
 
+    if "nodes" in table_names:
+        node_rows = {
+            str(row["id"]): row
+            for row in _load_table_rows(extract_dir, manifest, tables["nodes"])
+        }
+        for node_id, namespace in legacy_namespace.items():
+            row = node_rows.get(node_id)
+            if row is None:
+                continue
+            if row.get("name") is None:
+                row["name"] = namespace["name"]
+            if node_id != "/" and row.get("parent_id") is None:
+                row["parent_id"] = namespace["parent_id"]
+    else:
+        node_rows = _load_legacy_node_rows(extract_dir, manifest)
+
+    folder_rows = {
+        str(row["id"]): row
+        for row in (
+            _load_table_rows(extract_dir, manifest, tables["folders"])
+            if "folders" in table_names
+            else []
+        )
+    }
+    document_rows = {
+        str(row["id"]): row
+        for row in (
+            _load_table_rows(extract_dir, manifest, tables["documents"])
+            if "documents" in table_names
+            else []
+        )
+    }
+
+    if node_rows and "/" not in node_rows:
+        node_rows["/"] = {
+            "id": "/",
+            "type": "directory",
+            "inherit": True,
+            "status": 0,
+            "status_operation_id": None,
+            "access_rule_set_id": None,
+            "name": "/",
+            "parent_id": None,
+        }
+    if node_rows and "/" not in folder_rows:
+        folder_rows["/"] = {"id": "/", "created_time": 0.0}
+
+    folder_node_ids = {
+        node_id for node_id, row in node_rows.items() if row["type"] == "directory"
+    }
+    document_node_ids = {
+        node_id for node_id, row in node_rows.items() if row["type"] == "document"
+    }
+    if folder_node_ids != set(folder_rows):
+        raise BackupFormatError("Backup node and folder rows do not match")
+    if document_node_ids != set(document_rows):
+        raise BackupFormatError("Backup node and document rows do not match")
+
+    pending_folders = set(folder_node_ids)
+    restored_folders: set[str] = set()
+    while pending_folders:
+        ready = sorted(
+            node_id
+            for node_id in pending_folders
+            if node_id == "/" or node_rows[node_id]["parent_id"] in restored_folders
+        )
+        if not ready:
+            raise BackupFormatError(
+                "Backup folder hierarchy contains a cycle or missing parent"
+            )
+        for node_id in ready:
+            _insert_restored_node(
+                connection,
+                tables["nodes"],
+                node_rows[node_id],
+                deferred_updates,
+            )
+            connection.execute(insert(tables["folders"]), folder_rows[node_id])
+            restored_folders.add(node_id)
+            pending_folders.remove(node_id)
+
+    for node_id in sorted(document_node_ids):
+        node_row = node_rows[node_id]
+        if node_row["parent_id"] not in restored_folders:
+            raise BackupFormatError(
+                f"Backup document {node_id!r} references a missing folder"
+            )
+        _insert_restored_node(
+            connection,
+            tables["nodes"],
+            node_row,
+            deferred_updates,
+        )
+        document_row = document_rows[node_id]
+        deferred_updates.setdefault("documents", []).append(document_row.copy())
+        insert_row = document_row.copy()
+        insert_row["current_revision_id"] = None
+        connection.execute(insert(tables["documents"]), insert_row)
+
+    return node_table_names
+
+
+def _insert_restored_node(
+    connection,
+    table: Table,
+    row: dict[str, Any],
+    deferred_updates: dict[str, list[dict[str, Any]]],
+) -> None:
+    deferred_updates.setdefault("nodes", []).append(row.copy())
+    insert_row = row.copy()
+    insert_row["access_rule_set_id"] = None
+    try:
+        connection.execute(insert(table), insert_row)
+    except IntegrityError as exc:
+        if not is_node_name_conflict(exc):
+            raise
+        raise BackupFormatError(
+            "Backup contains an active sibling name conflict while restoring "
+            f"{row['type']}:{row['id']} under parent {row['parent_id']!r} "
+            f"with name {row['name']!r}"
+        ) from exc
+
+
+def _load_legacy_node_rows(
+    extract_dir: Path,
+    manifest: dict[str, Any],
+) -> dict[str, dict[str, Any]]:
     node_rows: dict[str, dict[str, Any]] = {}
     for table_name, node_type in (("folders", "directory"), ("documents", "document")):
-        if table_name not in manifest.get("tables", {}):
+        table_manifest = manifest.get("tables", {}).get(table_name)
+        if table_manifest is None:
             continue
-        table_manifest = manifest["tables"][table_name]
         path = _safe_payload_path(extract_dir, f"tables/{table_name}.jsonl")
         with path.open("rb") as f:
             rows = [orjson.loads(line) for line in f if line.strip()]
@@ -1444,16 +1645,65 @@ def _restore_legacy_nodes_if_needed(
                 raise BackupFormatError(
                     f"Duplicate document/folder node id in backup: {node_id!r}"
                 )
+            parent_id = row.get("parent_id", row.get("folder_id"))
+            if node_id != "/" and parent_id is None:
+                parent_id = "/"
             node_rows[node_id] = {
                 "id": node_id,
                 "type": node_type,
                 "inherit": row.get("inherit", True),
                 "status": row.get("status", 0),
                 "status_operation_id": row.get("status_operation_id"),
+                "access_rule_set_id": None,
+                "name": row.get("name", row.get("title")),
+                "parent_id": parent_id,
             }
+    return node_rows
 
-    if node_rows:
-        connection.execute(insert(tables["nodes"]), list(node_rows.values()))
+
+def _load_legacy_node_namespace(
+    extract_dir: Path,
+    manifest: dict[str, Any],
+) -> dict[str, dict[str, Any]]:
+    namespace: dict[str, dict[str, Any]] = {}
+    layouts = {
+        "folders": ("name", "parent_id"),
+        "documents": ("title", "folder_id"),
+    }
+    for table_name, (name_column, parent_column) in layouts.items():
+        table_manifest = manifest.get("tables", {}).get(table_name)
+        if table_manifest is None:
+            continue
+        columns = table_manifest.get("columns")
+        if columns is not None and name_column not in columns:
+            continue
+        path = _safe_payload_path(extract_dir, f"tables/{table_name}.jsonl")
+        row_count = 0
+        with path.open("rb") as f:
+            for line_number, line in enumerate(f, start=1):
+                if not line.strip():
+                    continue
+                try:
+                    row = orjson.loads(line)
+                except orjson.JSONDecodeError as exc:
+                    raise BackupFormatError(
+                        f"Invalid JSON row in {path} at line {line_number}"
+                    ) from exc
+                row_count += 1
+                namespace[str(row["id"])] = {
+                    "name": row.get(name_column),
+                    "parent_id": (
+                        row.get(parent_column)
+                        if row["id"] == "/" or row.get(parent_column) is not None
+                        else "/"
+                    ),
+                }
+        if row_count != table_manifest["rows"]:
+            raise BackupFormatError(
+                f"Row count mismatch for table {table_name!r}: "
+                f"manifest says {table_manifest['rows']}, payload has {row_count}"
+            )
+    return namespace
 
 
 def _build_missing_compiled_rule_set_mapping(
@@ -1526,7 +1776,7 @@ def _restore_missing_compiled_rule_sets(
     if not rule_set_id_by_node:
         return
 
-    created_at = dt.datetime.now(dt.timezone.utc).timestamp()
+    created_at = dt.datetime.now(dt.UTC).timestamp()
     connection.execute(
         insert(tables["compiled_access_rule_sets"]),
         [
@@ -1614,6 +1864,38 @@ def _load_table_rows(
     return rows
 
 
+def _load_legacy_banned_subnet_reasons(
+    extract_dir: Path,
+    manifest: dict[str, Any],
+) -> dict[str, str | None]:
+    table_manifest = manifest.get("tables", {}).get("banned_subnets")
+    if table_manifest is None:
+        return {}
+
+    path = _safe_payload_path(extract_dir, "tables/banned_subnets.jsonl")
+    reasons: dict[str, str | None] = {}
+    row_count = 0
+    with path.open("rb") as f:
+        for line_number, line in enumerate(f, start=1):
+            if not line.strip():
+                continue
+            try:
+                row = orjson.loads(line)
+            except orjson.JSONDecodeError as exc:
+                raise BackupFormatError(
+                    f"Invalid JSON row in {path} at line {line_number}"
+                ) from exc
+            row_count += 1
+            if "reason" in row and "reason_comment_id" not in row:
+                reasons[str(row["subnet"])] = row["reason"]
+    if row_count != table_manifest["rows"]:
+        raise BackupFormatError(
+            "Row count mismatch for table 'banned_subnets': "
+            f"manifest says {table_manifest['rows']}, payload has {row_count}"
+        )
+    return reasons
+
+
 def _load_legacy_access_rule_rows(
     extract_dir: Path,
     manifest: dict[str, Any],
@@ -1689,14 +1971,42 @@ def _coerce_legacy_rule_data(value: Any) -> dict[str, Any]:
 
 
 def _decode_row(row: dict[str, Any], table: Table) -> dict[str, Any]:
+    if table.name == "banned_subnets":
+        created_at = row.get("created_at")
+        if isinstance(created_at, str):
+            parsed_created_at = dt.datetime.fromisoformat(created_at)
+            if parsed_created_at.tzinfo is None:
+                parsed_created_at = parsed_created_at.replace(tzinfo=dt.UTC)
+            created_at = parsed_created_at.timestamp()
+            row = {**row, "created_at": created_at}
+        if "starts_at" not in row:
+            row = {**row, "starts_at": created_at}
+        if "expires_at" not in row:
+            row = {**row, "expires_at": None}
+
     decoded = {}
     for column in table.columns:
+        if column.computed is not None:
+            continue
         if column.name not in row:
             decoded[column.name] = None
             continue
         value = row[column.name]
         if value is not None and isinstance(column.type, DateTime):
             value = dt.datetime.fromisoformat(value)
+        if (
+            value is not None
+            and table.name == "comments"
+            and column.name == "content_digest"
+        ):
+            if not isinstance(value, str) or len(value) != 64:
+                raise BackupFormatError("Invalid comment digest in backup")
+            try:
+                value = bytes.fromhex(value)
+            except ValueError as exc:
+                raise BackupFormatError("Invalid comment digest in backup") from exc
+            if len(value) != 32:
+                raise BackupFormatError("Invalid comment digest in backup")
         decoded[column.name] = value
     return decoded
 
@@ -1715,6 +2025,9 @@ def _validate_manifest(manifest: dict[str, Any]) -> None:
     legacy_expected = (
         expected - compiled_access_rule_tables
     ) | legacy_access_rule_tables
+    # Schedules were added without changing the backup format version, so full
+    # backups created before that table existed remain compatible.
+    compatible_table_names = table_names | {"schedules"}
     unknown_tables = table_names - expected - legacy_access_rule_tables
     if unknown_tables:
         raise BackupFormatError(
@@ -1722,9 +2035,9 @@ def _validate_manifest(manifest: dict[str, Any]) -> None:
         )
     if (
         "components" not in manifest
-        and table_names != expected
-        and table_names != previous_compiled_expected
-        and table_names != legacy_expected
+        and compatible_table_names != expected
+        and compatible_table_names != previous_compiled_expected
+        and compatible_table_names != legacy_expected
     ):
         raise BackupFormatError(
             "Backup table set does not match this server version: "
@@ -1771,27 +2084,26 @@ def _load_manifest(path: Path) -> dict[str, Any]:
 
 def _safe_extract_tar_xz(source_path: Path, target_dir: Path) -> None:
     LOGGER.debug("Extracting compressed payload %s to %s", source_path, target_dir)
-    with lzma.open(source_path, "rb") as compressed:
-        with tarfile.open(fileobj=compressed, mode="r|") as tar:
-            for member in tar:
-                LOGGER.debug("Extracting archive member %s", member.name)
-                target_path = _safe_payload_path(target_dir, member.name)
-                if member.isdir():
-                    target_path.mkdir(parents=True, exist_ok=True)
-                    continue
-                if not member.isfile():
-                    raise BackupFormatError(
-                        f"Unsupported archive member type: {member.name}"
-                    )
-                target_path.parent.mkdir(parents=True, exist_ok=True)
-                extracted = tar.extractfile(member)
-                if extracted is None:
-                    raise BackupFormatError(
-                        f"Unable to read archive member: {member.name}"
-                    )
-                with extracted:
-                    with target_path.open("wb") as target:
-                        shutil.copyfileobj(extracted, target, length=1024 * 1024)
+    with (
+        lzma.open(source_path, "rb") as compressed,
+        tarfile.open(fileobj=compressed, mode="r|") as tar,
+    ):
+        for member in tar:
+            LOGGER.debug("Extracting archive member %s", member.name)
+            target_path = _safe_payload_path(target_dir, member.name)
+            if member.isdir():
+                target_path.mkdir(parents=True, exist_ok=True)
+                continue
+            if not member.isfile():
+                raise BackupFormatError(
+                    f"Unsupported archive member type: {member.name}"
+                )
+            target_path.parent.mkdir(parents=True, exist_ok=True)
+            extracted = tar.extractfile(member)
+            if extracted is None:
+                raise BackupFormatError(f"Unable to read archive member: {member.name}")
+            with extracted, target_path.open("wb") as target:
+                shutil.copyfileobj(extracted, target, length=1024 * 1024)
     LOGGER.debug("Compressed payload extracted to %s", target_dir)
 
 
@@ -1952,6 +2264,21 @@ def _serialize_value(value: Any) -> Any:
     return value
 
 
+def _serialize_table_value(table_name: str, column_name: str, value: Any) -> Any:
+    if (
+        value is not None
+        and table_name == "comments"
+        and column_name == "content_digest"
+    ):
+        if not isinstance(value, (bytes, bytearray, memoryview)):
+            raise BackupIntegrityError("Invalid binary comment digest in database")
+        digest = bytes(value)
+        if len(digest) != 32:
+            raise BackupIntegrityError("Invalid binary comment digest in database")
+        return digest.hex()
+    return _serialize_value(value)
+
+
 def _encode_bytes(value: bytes) -> str:
     return base64.urlsafe_b64encode(value).decode("ascii").rstrip("=")
 
@@ -2010,7 +2337,7 @@ def _config_get(config, keys: tuple[str, ...], default: Any = None) -> Any:
     for key in keys:
         try:
             value = value[key]
-        except (KeyError, TypeError):
+        except KeyError, TypeError:
             return default
     if isinstance(value, (str, int, float, bool)) or value is None:
         return value

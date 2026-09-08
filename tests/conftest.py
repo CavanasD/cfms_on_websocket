@@ -6,58 +6,71 @@ import asyncio
 import os
 import secrets
 import subprocess
+import sys
 from collections.abc import AsyncGenerator, Callable, Generator
-from pathlib import Path
+from contextlib import AbstractContextManager
 
 import pytest
 import pytest_asyncio
 
-from tests.support.server import start_server, stop_server
-from tests.support.test_config import (
+from tests.support.client import CFMSTestClient
+from tests.support.config import (
     ServerTestSettings,
-    capture_config,
-    reserve_local_port,
-    restore_config,
-    write_test_config,
+    managed_test_config,
 )
-from tests.test_client import CFMSTestClient
-from tests.utils import assert_success
+from tests.support.server import start_server, stop_server
+from tests.support.utils import assert_success
+
+_TEST_CONFIG_MANAGER = pytest.StashKey[AbstractContextManager[ServerTestSettings]]()
+_TEST_SERVER_SETTINGS = pytest.StashKey[ServerTestSettings]()
+
+
+@pytest.hookimpl(wrapper=True, tryfirst=True)
+def pytest_sessionstart(session: pytest.Session) -> Generator[None]:
+    manager = managed_test_config()
+    settings = manager.__enter__()
+    try:
+        session.config.stash[_TEST_CONFIG_MANAGER] = manager
+        session.config.stash[_TEST_SERVER_SETTINGS] = settings
+        yield
+    except BaseException:
+        manager.__exit__(*sys.exc_info())
+        raise
+
+
+@pytest.hookimpl(wrapper=True, tryfirst=True)
+def pytest_sessionfinish(
+    session: pytest.Session,
+    exitstatus: int | pytest.ExitCode,
+) -> Generator[None]:
+    try:
+        yield
+    finally:
+        manager = session.config.stash.get(_TEST_CONFIG_MANAGER, None)
+        if manager is not None:
+            try:
+                settings_module = sys.modules.get("include.config.settings")
+                if settings_module is not None:
+                    settings_module.global_config.stop()
+            finally:
+                manager.__exit__(None, None, None)
 
 
 @pytest.fixture(scope="session")
-def protected_test_config() -> Generator[ServerTestSettings]:
-    """Write test config, then restore the original config at session teardown."""
-    src_dir = Path("src").resolve()
-    config_backup = capture_config(src_dir / "config.toml")
-    port = reserve_local_port()
-    old_env = {
-        key: os.environ.get(key)
-        for key in ("CFMS_TEST_HOST", "CFMS_TEST_PORT", "CFMS_TEST_USE_SSL")
-    }
-
+def protected_test_config(
+    request: pytest.FixtureRequest,
+) -> Generator[ServerTestSettings]:
+    settings = request.config.stash[_TEST_SERVER_SETTINGS]
+    src_dir = settings.src_dir
     artifacts = ["init", "app.db", "admin_password.txt"]
-    try:
-        settings = write_test_config(src_dir, port)
-        os.environ["CFMS_TEST_HOST"] = settings.host
-        os.environ["CFMS_TEST_PORT"] = str(settings.port)
-        os.environ["CFMS_TEST_USE_SSL"] = "1" if settings.use_ssl else "0"
+    for artifact in artifacts:
+        artifact_path = src_dir / artifact
+        if artifact_path.exists():
+            artifact_path.unlink()
 
-        for artifact in artifacts:
-            artifact_path = src_dir / artifact
-            if artifact_path.exists():
-                artifact_path.unlink()
-
-        (src_dir / "content" / "ssl").mkdir(parents=True, exist_ok=True)
-        (src_dir / "content" / "logs").mkdir(parents=True, exist_ok=True)
-
-        yield settings
-    finally:
-        restore_config(config_backup)
-        for key, value in old_env.items():
-            if value is None:
-                os.environ.pop(key, None)
-            else:
-                os.environ[key] = value
+    (src_dir / "content" / "ssl").mkdir(parents=True, exist_ok=True)
+    (src_dir / "content" / "logs").mkdir(parents=True, exist_ok=True)
+    yield settings
 
 
 @pytest.fixture(scope="session")
@@ -83,7 +96,7 @@ def admin_credentials(server_process) -> dict:
     if not os.path.exists(password_file):
         raise RuntimeError("Admin password file not found after server started")
 
-    with open(password_file, "r", encoding="utf-8") as f:
+    with open(password_file, encoding="utf-8") as f:
         password = f.read().strip()
     if not password:
         raise RuntimeError("Admin password file is empty")
@@ -150,18 +163,37 @@ async def unauthenticated_client(
 
 
 @pytest_asyncio.fixture
+async def low_privilege_client(
+    unauthenticated_client: CFMSTestClient,
+    user_factory,
+) -> CFMSTestClient:
+    user = await user_factory()
+    response = await unauthenticated_client.login(user["username"], user["password"])
+    assert_success(response)
+    return unauthenticated_client
+
+
+@pytest_asyncio.fixture
 async def user_factory(
     authenticated_client: CFMSTestClient,
 ) -> AsyncGenerator[Callable]:
     created_users = []
 
     async def _creator(
-        username=None, password="TestPassword123!", nickname="Test User"
+        username=None,
+        password="TestPassword123!",
+        nickname="Test User",
+        groups=None,
+        permissions=None,
     ):
         if not username:
             username = f"user_{secrets.token_hex(4)}"
         response = await authenticated_client.create_user(
-            username=username, password=password, nickname=nickname
+            username=username,
+            password=password,
+            nickname=nickname,
+            groups=groups,
+            permissions=permissions,
         )
         assert_success(response)
         created_users.append(username)

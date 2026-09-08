@@ -1,25 +1,26 @@
 __all__ = [
-    "RequestListUsersHandler",
-    "RequestCreateUserHandler",
-    "RequestDeleteUserHandler",
-    "RequestRenameUserHandler",
     "RequestBlockUserHandler",
-    "RequestUnblockUserHandler",
-    "RequestListUserBlocksHandler",
-    "RequestGetUserInfoHandler",
-    "RequestGetUserAvatarHandler",
-    "RequestSetUserAvatarHandler",
     "RequestChangeUserGroupsHandler",
     "RequestChangeUserPermissionsHandler",
-    "RequestSetPasswdHandler",
+    "RequestCreateUserHandler",
+    "RequestDeleteUserHandler",
+    "RequestGetUserAvatarHandler",
+    "RequestGetUserInfoHandler",
+    "RequestListUserBlocksHandler",
+    "RequestListUsersHandler",
     "RequestManageUserStatusHandler",
+    "RequestRenameUserHandler",
+    "RequestSetPasswdHandler",
+    "RequestSetUserAvatarHandler",
+    "RequestUnblockUserHandler",
+    "RequestUpdateUserBlockHandler",
 ]
 
 import time
+from typing import Annotated, Literal, Self
 
 import filetype
-from argon2 import PasswordHasher
-from argon2.exceptions import InvalidHashError, VerificationError, VerifyMismatchError
+from pydantic import Field, model_validator
 from sqlalchemy import and_, func, or_
 from sqlalchemy.orm import selectinload
 
@@ -37,42 +38,155 @@ from include.database.models.identity import (
     UserStatus,
 )
 from include.database.session import Session
+from include.domains.access.authorization.evaluation import check_access_requirements
 from include.domains.access.permissions import Permissions
 from include.domains.documents.handlers.documents import create_file_task
 from include.domains.identity.commands.users import create_user
+from include.domains.identity.password_auth import verify_password_or_dummy
+from include.domains.identity.permission_entries import serialize_permission_entries
+from include.domains.identity.request_models import (
+    OffsetPaginationRequest,
+    PermissionEntry,
+)
+from include.domains.identity.types import RequestUsername
 from include.domains.identity.validators.passwords import (
     InvalidPasswordLengthError,
     RuleRequirementsNotMetError,
     check_passwd_requirements,
 )
+from include.domains.operations.comments import (
+    CommentStore,
+    OperationReason,
+    reason_change_audit_data,
+)
 from include.domains.pagination import (
-    CURSOR_PAGINATION_SCHEMA,
-    OFFSET_PAGINATION_SCHEMA,
     CursorError,
     PaginationCursor,
+    PaginationCursorToken,
+    PaginationPageSize,
     get_offset_pagination,
     get_page_size,
     make_cursor_response,
 )
+from include.domains.security.guards.login import AuthFactor, LoginGuard
 from include.messages import Messages as smsg
+from include.transport.client_address import get_client_ip
 from include.transport.connection import ConnectionHandler
-from include.transport.request_handler import RequestHandler, Result
+from include.transport.request_handler import (
+    REQUEST_UNSET,
+    Omittable,
+    RequestDataModel,
+    RequestHandler,
+    Result,
+)
+from include.types import NonEmptyString, NonNegativeFloat
 
-# Module-level PasswordHasher instance — reused across all calls to avoid
-# repeated construction overhead.
-_password_hasher = PasswordHasher()
+
+class _TimedGroup(RequestDataModel):
+    group_name: str
+    start_time: float
+    end_time: Omittable[float] = REQUEST_UNSET
+
+
+class _CreateUserRequest(RequestDataModel):
+    username: RequestUsername
+    password: str
+    nickname: Omittable[str] = REQUEST_UNSET
+    permissions: Omittable[list[PermissionEntry]] = REQUEST_UNSET
+    groups: Omittable[list[_TimedGroup]] = REQUEST_UNSET
+
+
+class _UsernameRequest(RequestDataModel):
+    username: NonEmptyString
+
+
+class _RenameUserRequest(RequestDataModel):
+    username: NonEmptyString
+    nickname: str | None = None
+
+
+class _BlockTarget(RequestDataModel):
+    type: Literal["all", "directory", "document"]
+    id: Omittable[NonEmptyString] = REQUEST_UNSET
+
+
+class _BlockUserRequest(RequestDataModel):
+    username: NonEmptyString
+    target: _BlockTarget
+    block_types: Annotated[list[str], Field(min_length=1)]
+    not_before: Omittable[NonNegativeFloat] = REQUEST_UNSET
+    not_after: Omittable[float] = REQUEST_UNSET
+    reason: OperationReason | None = None
+
+
+class _BlockIDRequest(RequestDataModel):
+    block_id: NonEmptyString
+
+
+class _UpdateUserBlockRequest(RequestDataModel):
+    block_id: NonEmptyString
+    reason: OperationReason | None
+
+
+class _ListUserBlocksRequest(RequestDataModel):
+    username: NonEmptyString
+    page_size: Omittable[PaginationPageSize] = REQUEST_UNSET
+    cursor: PaginationCursorToken | None = None
+
+
+class _SetUserAvatarRequest(RequestDataModel):
+    username: NonEmptyString
+    document_id: NonEmptyString
+
+
+class _ChangeUserGroupsRequest(RequestDataModel):
+    username: NonEmptyString
+    groups: Omittable[list[str]] = REQUEST_UNSET
+
+
+class _ChangeUserPermissionsRequest(RequestDataModel):
+    username: NonEmptyString
+    permissions: list[PermissionEntry]
+
+
+class _SetPasswordRequest(RequestDataModel):
+    username: RequestUsername
+    old_passwd: str | None = None
+    new_passwd: NonEmptyString
+    force_update_after_login: Omittable[bool] = REQUEST_UNSET
+    bypass_passwd_requirements: Omittable[bool] = REQUEST_UNSET
+
+
+class _ManageUserStatusRequest(RequestDataModel):
+    status: Literal["active", "disabled"]
+    username: NonEmptyString
+    reason: Omittable[OperationReason | None] = REQUEST_UNSET
+
+    @model_validator(mode="after")
+    def reject_reason_when_activating(self) -> Self:
+        if self.status == "active" and "reason" in self.model_fields_set:
+            raise ValueError("reason is not allowed when activating a user")
+        return self
+
+
+def _serialize_user_block(entry: UserBlockEntry) -> dict:
+    return {
+        "block_id": entry.block_id,
+        "timestamp": entry.timestamp,
+        "not_before": entry.not_before,
+        "not_after": entry.not_after,
+        "target_type": entry.target_type,
+        "target_id": entry.target_id,
+        "block_types": [sub_entry.block_type for sub_entry in entry.sub_entries],
+        "reason": entry.reason,
+    }
 
 
 class RequestListUsersHandler(RequestHandler):
-    schema = {
-        "type": "object",
-        "properties": {
-            **OFFSET_PAGINATION_SCHEMA,
-        },
-        "additionalProperties": False,
-    }
+    request_model = OffsetPaginationRequest
 
     require_auth = True
+    rate_limit_cost = 3
 
     def handle(self, handler: ConnectionHandler):
         offset, count = get_offset_pagination(handler.data)
@@ -102,7 +216,12 @@ class RequestListUsersHandler(RequestHandler):
                     "nickname": user.nickname,
                     "created_time": user.created_time,
                     "last_login": user.last_login,
-                    "permissions": list(user.all_permissions),
+                    "permissions": serialize_permission_entries(user.rights),
+                    "effective_permissions": sorted(user.all_permissions),
+                    "effective_own_permissions": sorted(user.own_permissions),
+                    "effective_inherited_permissions": sorted(
+                        user.inherited_permissions
+                    ),
                     "groups": list(user.all_groups),
                 }
                 for user in users
@@ -127,44 +246,10 @@ class RequestListUsersHandler(RequestHandler):
 
 
 class RequestCreateUserHandler(RequestHandler):
-    schema = {
-        "type": "object",
-        "properties": {
-            "username": {"type": "string", "minLength": 1, "maxLength": 64},
-            "password": {"type": "string"},
-            "nickname": {"type": "string"},
-            "permissions": {
-                "type": "array",
-                "items": {
-                    "type": "object",
-                    "properties": {
-                        "permission": {"type": "string"},
-                        "start_time": {"type": "number"},
-                        "end_time": {"type": "number"},
-                    },
-                    "required": ["permission", "start_time"],
-                    "additionalProperties": False,
-                },
-            },
-            "groups": {
-                "type": "array",
-                "items": {
-                    "type": "object",
-                    "properties": {
-                        "group_name": {"type": "string"},
-                        "start_time": {"type": "number"},
-                        "end_time": {"type": "number"},
-                    },
-                    "required": ["group_name", "start_time"],
-                    "additionalProperties": False,
-                },
-            },
-        },
-        "required": ["username", "password"],
-        "additionalProperties": False,
-    }
+    request_model = _CreateUserRequest
 
     require_auth = True
+    rate_limit_cost = 5
 
     def handle(self, handler: ConnectionHandler):
         data = handler.data
@@ -225,16 +310,10 @@ class RequestCreateUserHandler(RequestHandler):
 
 
 class RequestDeleteUserHandler(RequestHandler):
-    schema = {
-        "type": "object",
-        "properties": {
-            "username": {"type": "string", "minLength": 1},
-        },
-        "required": ["username"],
-        "additionalProperties": False,
-    }
+    request_model = _UsernameRequest
 
     require_auth = True
+    rate_limit_cost = 5
 
     def handle(self, handler: ConnectionHandler):
 
@@ -243,11 +322,9 @@ class RequestDeleteUserHandler(RequestHandler):
 
             if Permissions.DELETE_USER not in this_user.all_permissions:
                 handler.conclude_request(
-                    **{
-                        "code": 403,
-                        "message": "You do not have permission to delete users",
-                        "data": {},
-                    }
+                    code=403,
+                    message="You do not have permission to delete users",
+                    data={},
                 )
                 return
 
@@ -256,21 +333,13 @@ class RequestDeleteUserHandler(RequestHandler):
             user_to_delete = session.get(User, user_to_delete_username)
             if not user_to_delete:
                 handler.conclude_request(
-                    **{
-                        "code": 404,
-                        "message": "User does not exist",
-                        "data": {},
-                    }
+                    code=404, message="User does not exist", data={}
                 )
                 return
 
             if user_to_delete.username == this_user.username:
                 handler.conclude_request(
-                    **{
-                        "code": 400,
-                        "message": "Cannot delete yourself",
-                        "data": {},
-                    }
+                    code=400, message="Cannot delete yourself", data={}
                 )
                 return
 
@@ -311,18 +380,8 @@ class RequestDeleteUserHandler(RequestHandler):
 
 
 class RequestRenameUserHandler(RequestHandler):
-    schema = {
-        "type": "object",
-        "properties": {
-            "username": {
-                "type": "string",
-                "minLength": 1,
-            },
-            "nickname": {"anyOf": [{"type": "string"}, {"type": "null"}]},
-        },
-        "required": ["username"],
-        "additionalProperties": False,
-    }
+    request_model = _RenameUserRequest
+    rate_limit_cost = 5
 
     def handle(self, handler: ConnectionHandler):
 
@@ -333,24 +392,26 @@ class RequestRenameUserHandler(RequestHandler):
 
             if not this_user or not this_user.is_token_valid(handler.token):
                 handler.conclude_request(
-                    **{
-                        "code": 403,
-                        "message": "Invalid user or token",
-                        "data": {},
-                    }
+                    code=403, message="Invalid user or token", data={}
                 )
                 return
 
-            if (
-                Permissions.RENAME_USER not in this_user.all_permissions
-                and target_username != this_user.username
-            ):
+            permissions = this_user.all_permissions
+            is_renaming_self = target_username == this_user.username
+
+            has_permission = Permissions.SUPER_RENAME_USER in permissions or (
+                is_renaming_self and Permissions.RENAME_USER in permissions
+            )
+
+            if not has_permission:
                 handler.conclude_request(
-                    **{
-                        "code": 403,
-                        "message": "You do not have permission to rename users",
-                        "data": {},
-                    }
+                    code=403,
+                    message=(
+                        "You do not have permission to rename yourself"
+                        if is_renaming_self
+                        else "You do not have permission to rename users"
+                    ),
+                    data={},
                 )
                 return
 
@@ -359,11 +420,7 @@ class RequestRenameUserHandler(RequestHandler):
             user_to_rename = session.get(User, target_username)
             if not user_to_rename:
                 handler.conclude_request(
-                    **{
-                        "code": 400,
-                        "message": "User does not exist",
-                        "data": {},
-                    }
+                    code=400, message="User does not exist", data={}
                 )
                 return
 
@@ -387,39 +444,10 @@ class RequestBlockUserHandler(RequestHandler):
     (NOT multiple block types), it should be requested in installments.
     """
 
-    schema = {
-        "type": "object",
-        "properties": {
-            "username": {
-                "type": "string",
-                "minLength": 1,
-            },
-            "target": {
-                "type": "object",
-                "properties": {
-                    "type": {
-                        "type": "string",
-                        # "minLength": 1,
-                        "pattern": "^(all|directory|document)$",
-                    },
-                    "id": {"type": "string", "minLength": 1},
-                },
-                "required": ["type"],
-                "additionalProperties": False,
-            },
-            "block_types": {
-                "type": "array",
-                "minItems": 1,
-                "items": {"type": "string"},  # not empty
-            },
-            "not_before": {"type": "number", "minimum": 0},
-            "not_after": {"type": "number"},
-        },
-        "required": ["username", "block_types", "target"],
-        "additionalProperties": False,
-    }
+    request_model = _BlockUserRequest
 
     require_auth = True
+    rate_limit_cost = 3
 
     def handle(self, handler: ConnectionHandler):
 
@@ -428,6 +456,7 @@ class RequestBlockUserHandler(RequestHandler):
 
         not_before: int | float = handler.data.get("not_before", 0)
         not_after: int | float = handler.data.get("not_after", -1)
+        reason: str | None = handler.data.get("reason")
 
         target_type: str = handler.data["target"]["type"]
         target_id: str | None = handler.data["target"].get("id")
@@ -462,6 +491,11 @@ class RequestBlockUserHandler(RequestHandler):
                 not_after=not_after,
                 target_type=target_type,
                 target_id=target_id,
+                reason_comment_id=(
+                    CommentStore.get_or_create_id(session, reason)
+                    if reason is not None
+                    else None
+                ),
             )
             session.add(block_entry)
 
@@ -471,12 +505,20 @@ class RequestBlockUserHandler(RequestHandler):
                 )
                 session.add(new_sub_entry)
 
+            session.flush()
+            response_data = _serialize_user_block(block_entry)
             session.commit()
-            # get block_id
-            block_id = block_entry.block_id
 
-        handler.conclude_request(200, {"block_id": block_id}, "User blocked")
-        return Result(code=200, target=target_username, username=handler.username)
+        handler.conclude_request(200, response_data, "User blocked")
+        return Result(
+            code=200,
+            target=target_username,
+            data={
+                "block_id": response_data["block_id"],
+                **reason_change_audit_data(None, response_data["reason"]),
+            },
+            username=handler.username,
+        )
 
 
 class RequestUnblockUserHandler(RequestHandler):
@@ -484,19 +526,10 @@ class RequestUnblockUserHandler(RequestHandler):
     Handler for action `unblock_user`.
     """
 
-    schema = {
-        "type": "object",
-        "properties": {
-            "block_id": {
-                "type": "string",
-                "minLength": 1,
-            },
-        },
-        "required": ["block_id"],
-        "additionalProperties": False,
-    }
+    request_model = _BlockIDRequest
 
     require_auth = True
+    rate_limit_cost = 2
 
     def handle(self, handler: ConnectionHandler):
 
@@ -534,21 +567,64 @@ class RequestUnblockUserHandler(RequestHandler):
         return Result(code=200, target=block_id, username=handler.username)
 
 
-class RequestListUserBlocksHandler(RequestHandler):
-    schema = {
-        "type": "object",
-        "properties": {
-            "username": {
-                "type": "string",
-                "minLength": 1,
+class RequestUpdateUserBlockHandler(RequestHandler):
+    request_model = _UpdateUserBlockRequest
+    require_auth = True
+    rate_limit_cost = 3
+
+    def handle(self, handler: ConnectionHandler):
+        block_id: str = handler.data["block_id"]
+        reason: str | None = handler.data["reason"]
+
+        with Session() as session:
+            this_user = User.get_existing(session, handler.username)
+            if Permissions.BLOCK not in this_user.all_permissions:
+                handler.conclude_request(
+                    403, {}, "You do not have permission to update user blocks"
+                )
+                return Result(code=403, target=block_id, username=handler.username)
+
+            block_entry = session.get(
+                UserBlockEntry,
+                block_id,
+                options=(selectinload(UserBlockEntry.sub_entries),),
+            )
+            if block_entry is None:
+                handler.conclude_request(404, {}, "Specified entry not found")
+                return Result(code=404, target=block_id, username=handler.username)
+
+            previous_reason = block_entry.reason
+            if previous_reason != reason:
+                block_entry.reason_comment_id = (
+                    CommentStore.get_or_create_id(session, reason)
+                    if reason is not None
+                    else None
+                )
+            session.flush()
+            response_data = {
+                **_serialize_user_block(block_entry),
+                "reason": reason,
+            }
+            target_username = block_entry.username
+            session.commit()
+
+        handler.conclude_request(200, response_data, "User block updated")
+        return Result(
+            code=200,
+            target=block_id,
+            data={
+                "username": target_username,
+                **reason_change_audit_data(previous_reason, reason),
             },
-            **CURSOR_PAGINATION_SCHEMA,
-        },
-        "required": ["username"],
-        "additionalProperties": False,
-    }
+            username=handler.username,
+        )
+
+
+class RequestListUserBlocksHandler(RequestHandler):
+    request_model = _ListUserBlocksRequest
 
     require_auth = True
+    rate_limit_cost = 3
 
     def handle(self, handler: ConnectionHandler):
 
@@ -593,7 +669,10 @@ class RequestListUserBlocksHandler(RequestHandler):
 
             block_query = (
                 session.query(UserBlockEntry)
-                .options(selectinload(UserBlockEntry.sub_entries))
+                .options(
+                    selectinload(UserBlockEntry.sub_entries),
+                    selectinload(UserBlockEntry.reason_comment),
+                )
                 .filter(UserBlockEntry.username == target_username)
             )
             if last_key is not None:
@@ -616,21 +695,7 @@ class RequestListUserBlocksHandler(RequestHandler):
                 .all()
             )
 
-            blocks_data = []
-            for entry in block_entries:
-                blocks_data.append(
-                    {
-                        "block_id": entry.block_id,
-                        "timestamp": entry.timestamp,
-                        "not_before": entry.not_before,
-                        "not_after": entry.not_after,
-                        "target_type": entry.target_type,
-                        "target_id": entry.target_id,
-                        "block_types": [
-                            sub_entry.block_type for sub_entry in entry.sub_entries
-                        ],
-                    }
-                )
+            blocks_data = [_serialize_user_block(entry) for entry in block_entries]
 
             response_data = make_cursor_response(
                 blocks_data,
@@ -646,16 +711,10 @@ class RequestListUserBlocksHandler(RequestHandler):
 
 
 class RequestGetUserInfoHandler(RequestHandler):
-    schema = {
-        "type": "object",
-        "properties": {
-            "username": {"type": "string", "minLength": 1},
-        },
-        "required": ["username"],
-        "additionalProperties": False,
-    }
+    request_model = _UsernameRequest
 
     require_auth = True
+    rate_limit_cost = 2
 
     def handle(self, handler: ConnectionHandler):
         user_to_get_username = handler.data["username"]
@@ -663,49 +722,41 @@ class RequestGetUserInfoHandler(RequestHandler):
         with Session() as session:
             this_user = User.get_existing(session, handler.username)
 
-            user_to_get = session.get(User, user_to_get_username)
-            if not user_to_get:
-                handler.conclude_request(
-                    **{
-                        "code": 404,
-                        "message": "User does not exist",
-                        "data": {},
-                    }
-                )
-                return
-
             if (
                 user_to_get_username != this_user.username
                 and Permissions.GET_USER_INFO not in this_user.all_permissions
             ):
                 handler.conclude_request(
-                    **{
-                        "code": 403,
-                        "message": "You do not have permission to get user information",
-                        "data": {},
-                    }
+                    code=403,
+                    message="You do not have permission to get user information",
+                    data={},
+                )
+                return
+
+            user_to_get = session.get(User, user_to_get_username)
+            if not user_to_get:
+                handler.conclude_request(
+                    code=404, message="User does not exist", data={}
                 )
                 return
 
             user_info = {
                 "nickname": user_to_get.nickname,
                 "username": user_to_get.username,
-                "permissions": list(user_to_get.all_permissions),
-                "own_permissions": list(user_to_get.own_permissions),
-                "inherited_permissions": list(user_to_get.inherited_permissions),
+                "status": user_to_get.status,
+                "permissions": serialize_permission_entries(user_to_get.rights),
+                "effective_permissions": sorted(user_to_get.all_permissions),
+                "effective_own_permissions": sorted(user_to_get.own_permissions),
+                "effective_inherited_permissions": sorted(
+                    user_to_get.inherited_permissions
+                ),
                 "groups": list(user_to_get.all_groups),
                 "last_login": user_to_get.last_login,
                 "created_time": user_to_get.created_time,
                 "passwd_last_modified": user_to_get.passwd_last_modified,
             }
 
-            handler.conclude_request(
-                **{
-                    "code": 200,
-                    "message": "OK",
-                    "data": user_info,
-                }
-            )
+            handler.conclude_request(code=200, message="OK", data=user_info)
 
 
 class RequestGetUserAvatarHandler(RequestHandler):
@@ -717,61 +768,46 @@ class RequestGetUserAvatarHandler(RequestHandler):
     already included in the response.
     """
 
-    schema = {
-        "type": "object",
-        "properties": {
-            "username": {"type": "string", "minLength": 1},
-        },
-        "required": ["username"],
-        "additionalProperties": False,
-    }
+    request_model = _UsernameRequest
 
     require_auth = True
+    rate_limit_cost = 3
 
     def handle(self, handler: ConnectionHandler):
         user_to_get_username = handler.data["username"]
         if not user_to_get_username:
-            handler.conclude_request(
-                **{
-                    "code": 400,
-                    "message": "Username is required",
-                    "data": {},
-                }
-            )
+            handler.conclude_request(code=400, message="Username is required", data={})
             return
 
         with Session() as session:
             # when require_auth is True, user authentication has been verified
             this_user = User.get_existing(session, handler.username)
 
-            user_to_get = session.get(User, user_to_get_username)
-            if not user_to_get:
-                handler.conclude_request(
-                    **{
-                        "code": 404,
-                        "message": "User does not exist",
-                        "data": {},
-                    }
-                )
-                return
-
             if (
                 user_to_get_username != this_user.username
                 and Permissions.GET_USER_INFO not in this_user.all_permissions
             ):
                 handler.conclude_request(
-                    **{
-                        "code": 403,
-                        "message": "You do not have permission to get user information",
-                        "data": {},
-                    }
+                    code=403,
+                    message="You do not have permission to get user information",
+                    data={},
+                )
+                return
+
+            user_to_get = session.get(User, user_to_get_username)
+            if not user_to_get:
+                handler.conclude_request(
+                    code=404, message="User does not exist", data={}
                 )
                 return
 
             avatar = user_to_get.avatar
 
             if avatar:
-                avatar_task_data = create_file_task(avatar, TransferMode.DOWNLOAD)
+                avatar_task_data = create_file_task(
+                    session, avatar, TransferMode.DOWNLOAD
+                )
+                session.commit()
                 handler.conclude_request(
                     200, {"task_data": avatar_task_data}, smsg.SUCCESS
                 )
@@ -790,17 +826,10 @@ class RequestSetUserAvatarHandler(RequestHandler):
     designated as the avatar are changed later, the avatar setting will not be lost.
     """
 
-    schema = {
-        "type": "object",
-        "properties": {
-            "username": {"type": "string", "minLength": 1},
-            "document_id": {"type": "string", "minLength": 1},
-        },
-        "required": ["username", "document_id"],
-        "additionalProperties": False,
-    }
+    request_model = _SetUserAvatarRequest
 
     require_auth = True
+    rate_limit_cost = 3
 
     def handle(self, handler: ConnectionHandler):
         target_username: str = handler.data["username"]
@@ -809,15 +838,27 @@ class RequestSetUserAvatarHandler(RequestHandler):
         with Session() as session:
             this_user = User.get_existing(session, handler.username)
 
-            if (
-                target_username != this_user.username
-                and Permissions.SUPER_SET_USER_AVATAR not in this_user.all_permissions
-            ):
+            permissions = this_user.all_permissions
+            is_setting_own_avatar = target_username == this_user.username
+
+            has_permission = Permissions.SUPER_SET_USER_AVATAR in permissions or (
+                is_setting_own_avatar and Permissions.SET_USER_AVATAR in permissions
+            )
+
+            if not has_permission:
                 handler.conclude_request(
-                    403, {}, "You do not have permission to set other user's avatar"
+                    code=403,
+                    data={},
+                    message=(
+                        "You do not have permission to set your avatar"
+                        if is_setting_own_avatar
+                        else "You do not have permission to set another user's avatar"
+                    ),
                 )
                 return Result(
-                    code=403, target=target_username, username=handler.username
+                    code=403,
+                    target=target_username,
+                    username=handler.username,
                 )
 
             user_to_update = session.get(User, target_username)
@@ -831,7 +872,7 @@ class RequestSetUserAvatarHandler(RequestHandler):
                 handler.conclude_request(404, {}, "Document does not exist")
                 return
 
-            if not document.check_access_requirements(user_to_update, "read"):
+            if not check_access_requirements(session, user_to_update, document, "read"):
                 handler.conclude_request(
                     403, {}, "User does not have access to the specified document"
                 )
@@ -854,17 +895,10 @@ class RequestSetUserAvatarHandler(RequestHandler):
 
 
 class RequestChangeUserGroupsHandler(RequestHandler):
-    schema = {
-        "type": "object",
-        "properties": {
-            "username": {"type": "string", "minLength": 1},
-            "groups": {"type": "array", "items": {"type": "string"}},
-        },
-        "required": ["username"],
-        "additionalProperties": False,
-    }
+    request_model = _ChangeUserGroupsRequest
 
     require_auth = True
+    rate_limit_cost = 3
 
     def handle(self, handler: ConnectionHandler):
 
@@ -873,33 +907,23 @@ class RequestChangeUserGroupsHandler(RequestHandler):
 
             if Permissions.CHANGE_USER_GROUPS not in this_user.all_permissions:
                 handler.conclude_request(
-                    **{
-                        "code": 403,
-                        "message": "You do not have permission to change user groups",
-                        "data": {},
-                    }
+                    code=403,
+                    message="You do not have permission to change user groups",
+                    data={},
                 )
                 return
 
             user_to_change_username = handler.data["username"]
             if not user_to_change_username:
                 handler.conclude_request(
-                    **{
-                        "code": 400,
-                        "message": "Username is required",
-                        "data": {},
-                    }
+                    code=400, message="Username is required", data={}
                 )
                 return
 
             user_to_change = session.get(User, user_to_change_username)
             if not user_to_change:
                 handler.conclude_request(
-                    **{
-                        "code": 404,
-                        "message": "User does not exist",
-                        "data": {},
-                    }
+                    code=404, message="User does not exist", data={}
                 )
                 return
 
@@ -919,23 +943,10 @@ class RequestChangeUserGroupsHandler(RequestHandler):
 
 
 class RequestChangeUserPermissionsHandler(RequestHandler):
-    schema = {
-        "type": "object",
-        "properties": {
-            "username": {"type": "string", "minLength": 1},
-            "permissions": {
-                "type": "array",
-                "items": {
-                    "type": "string",
-                    "additionalProperties": False,
-                },
-            },
-        },
-        "required": ["username", "permissions"],
-        "additionalProperties": False,
-    }
+    request_model = _ChangeUserPermissionsRequest
 
     require_auth = True
+    rate_limit_cost = 3
 
     def handle(self, handler: ConnectionHandler):
         with Session() as session:
@@ -943,11 +954,9 @@ class RequestChangeUserPermissionsHandler(RequestHandler):
 
             if Permissions.SET_USER_PERMISSIONS not in this_user.all_permissions:
                 handler.conclude_request(
-                    **{
-                        "code": 403,
-                        "message": "You do not have permission to set user permissions",
-                        "data": {},
-                    }
+                    code=403,
+                    message="You do not have permission to set user permissions",
+                    data={},
                 )
                 return Result(
                     code=403, target=handler.data["username"], username=handler.username
@@ -956,42 +965,22 @@ class RequestChangeUserPermissionsHandler(RequestHandler):
             target_username = handler.data["username"]
             if not target_username:
                 handler.conclude_request(
-                    **{
-                        "code": 400,
-                        "message": "Username is required",
-                        "data": {},
-                    }
+                    code=400, message="Username is required", data={}
                 )
                 return
 
             user_to_change = session.get(User, target_username)
             if not user_to_change:
                 handler.conclude_request(
-                    **{
-                        "code": 404,
-                        "message": "User does not exist",
-                        "data": {},
-                    }
+                    code=404, message="User does not exist", data={}
                 )
                 return Result(
                     code=404, target=target_username, username=handler.username
                 )
 
             new_permissions = handler.data.get("permissions", [])
-
-            if not all(isinstance(permission, str) for permission in new_permissions):
-                handler.conclude_request(
-                    **{
-                        "code": 400,
-                        "message": "All permissions must be of type str",
-                        "data": {},
-                    }
-                )
-                return
-
-            if set(new_permissions) != user_to_change.own_permissions:
-                user_to_change.own_permissions = new_permissions
-                session.commit()
+            user_to_change.own_permissions = new_permissions
+            session.commit()
 
         response = {
             "code": 200,
@@ -1006,134 +995,116 @@ class RequestChangeUserPermissionsHandler(RequestHandler):
 
 
 class RequestSetPasswdHandler(RequestHandler):
-    schema = {
-        "type": "object",
-        "properties": {
-            "username": {"type": "string", "minLength": 1},
-            "old_passwd": {"anyOf": [{"type": "string"}, {"type": "null"}]},
-            "new_passwd": {"type": "string", "minLength": 1},
-            "force_update_after_login": {"type": "boolean"},
-            "bypass_passwd_requirements": {"type": "boolean"},
-        },
-        "required": ["username", "new_passwd"],
-        "additionalProperties": False,
-    }
+    request_model = _SetPasswordRequest
+    rate_limit_cost = 10
 
     def handle(self, handler: ConnectionHandler):
+        target_username: str = handler.data["username"]
+        old_passwd: str | None = handler.data.get("old_passwd")
+        new_passwd: str = handler.data["new_passwd"]
+        operator_username = handler.username
+        bypass_passwd_requirements: bool = handler.data.get(
+            "bypass_passwd_requirements", False
+        )
+        force_update_after_login: bool = handler.data.get(
+            "force_update_after_login", False
+        )
+        ip: str | None = None
+
+        def respond(
+            code: int,
+            message: str,
+            data: dict | None = None,
+            *,
+            username: str | None = None,
+        ) -> Result:
+            handler.conclude_request(code=code, data=data or {}, message=message)
+            return Result(code=code, target=target_username, username=username)
+
+        if old_passwd is not None:
+            ip = get_client_ip(handler.stream.connection._ws)
+            decision = LoginGuard.evaluate(ip, target_username, AuthFactor.PASSWORD)
+            if not decision.allowed:
+                data = {}
+                if decision.retry_after_seconds is not None:
+                    data["retry_after_seconds"] = decision.retry_after_seconds
+                return respond(
+                    429,
+                    "Too many authentication attempts. Please try again later.",
+                    data,
+                )
 
         with Session() as session:
-            operator_username = handler.username
-
-            target_username = handler.data.get("username", None)
-            old_passwd = handler.data.get("old_passwd", None)
-            new_passwd: str = handler.data["new_passwd"]
-            # sysop feature.
-            bypass_passwd_requirements: bool = handler.data.get(
-                "bypass_passwd_requirements", False
-            )
-            force_update_after_login: bool = handler.data.get(
-                "force_update_after_login", False
-            )
-
-            user = session.get(User, target_username)
-            if not user:
-                handler.conclude_request(
-                    **{
-                        "code": 401,
-                        "message": "Invalid credentials",
-                        "data": {},
-                    }
-                )
-                return
-
-            # Initialize the operator user. If no operator is specified, the
-            # target user acts as the operator.
+            operator_user = None
             if operator_username:
                 if not handler.token:
-                    handler.conclude_request(
-                        **{
-                            "code": 400,
-                            "message": "Given an operator, token is required",
-                            "data": {},
-                        }
-                    )
-                    return
+                    return respond(400, "Given an operator, token is required")
 
                 operator_user = session.get(User, operator_username)
                 if not operator_user or not operator_user.is_token_valid(handler.token):
-                    handler.conclude_request(
-                        **{
-                            "code": 401,
-                            "message": "Invalid user or token",
-                            "data": {},
-                        }
-                    )
-                    return
-            else:  # operator_user should never be used on this path.
-                operator_user = None
+                    return respond(401, "Invalid user or token")
 
-            if old_passwd:  # An old password means the user changes their own password.
-                # Disallow these elevated flags when a user is changing their own password
-                _flags_set = []
+            if old_passwd is not None:
+                user = session.get(User, target_username)
+                if not verify_password_or_dummy(user, old_passwd):
+                    assert ip is not None
+                    LoginGuard.report_failure(ip, target_username, AuthFactor.PASSWORD)
+                    return respond(401, "Invalid credentials")
+
+                assert user is not None
+                assert ip is not None
+                LoginGuard.report_success(
+                    ip,
+                    target_username,
+                    AuthFactor.PASSWORD,
+                    completed_authentication=True,
+                )
+                actor_username = target_username
+
+                flags_set = []
                 if bypass_passwd_requirements:
-                    _flags_set.append("bypass_passwd_requirements")
+                    flags_set.append("bypass_passwd_requirements")
                 if force_update_after_login:
-                    _flags_set.append("force_update_after_login")
+                    flags_set.append("force_update_after_login")
 
-                if _flags_set:
-                    handler.conclude_request(
+                if flags_set:
+                    return respond(
                         400,
-                        message="The following options cannot be set to True when changing your own password: "
-                        + ", ".join(_flags_set),
-                        data={flag: True for flag in _flags_set},
+                        "The following options cannot be set to True when "
+                        "changing your own password: " + ", ".join(flags_set),
+                        {flag: True for flag in flags_set},
+                        username=actor_username,
                     )
-                    return
-
-                if not user.verify_password(old_passwd):
-                    handler.conclude_request(
-                        **{
-                            "code": 401,
-                            "message": "Invalid credentials",
-                            "data": {},
-                        }
-                    )
-                    return
                 if user.status != UserStatus.ACTIVE:
-                    handler.conclude_request(403, {}, "Account is not active")
-                    return
+                    return respond(
+                        403, "Account is not active", username=actor_username
+                    )
 
                 if not (
                     {Permissions.SET_PASSWD, Permissions.SUPER_SET_PASSWD}
                     & user.all_permissions
                 ):
-                    handler.conclude_request(
-                        **{
-                            "code": 403,
-                            "message": "You do not have permission to change your own password",
-                            "data": {},
-                        }
+                    return respond(
+                        403,
+                        "You do not have permission to change your own password",
+                        username=actor_username,
                     )
-                    return
-
-            else:  # User changes another user's password.
+            else:
                 if not operator_user:
-                    handler.conclude_request(
-                        **{
-                            "code": 400,
-                            "message": "Operator is required when setting other user password",
-                            "data": {},
-                        }
+                    return respond(
+                        400, "Operator is required when setting other user password"
                     )
-                    return
                 if Permissions.SUPER_SET_PASSWD not in operator_user.all_permissions:
-                    handler.conclude_request(
-                        **{
-                            "code": 403,
-                            "message": "You do not have permission to set user password",
-                            "data": {},
-                        }
+                    return respond(
+                        403,
+                        "You do not have permission to set user password",
+                        username=operator_username,
                     )
-                    return
+
+                actor_username = operator_username
+                user = session.get(User, target_username)
+                if user is None:
+                    return respond(404, "User does not exist", username=actor_username)
 
             try:
                 if not bypass_passwd_requirements:
@@ -1145,67 +1116,50 @@ class RequestSetPasswdHandler(RequestHandler):
                         global_config["security"]["passwd_min_passed_count"],
                     )
             except InvalidPasswordLengthError as e:
-                handler.conclude_request(
+                return respond(
                     400,
-                    {"min_length": e.min_length, "max_length": e.max_length},
                     str(e),
+                    {"min_length": e.min_length, "max_length": e.max_length},
+                    username=actor_username,
                 )
-                return Result(code=400, target=target_username)
             except RuleRequirementsNotMetError as e:
-                handler.conclude_request(
+                return respond(
                     400,
+                    str(e),
                     {
                         "passed_count": e.passed_count,
                         "min_passed_count": e.min_passed_count,
                         "unpassed_rules": tuple(e.unpassed_rules),
                     },
-                    str(e),
+                    username=actor_username,
                 )
-                return Result(code=400, target=target_username)
 
-            try:
-                _same = _password_hasher.verify(user.pass_hash, new_passwd)
-            except (VerifyMismatchError, VerificationError, InvalidHashError):
-                _same = False
-
-            if _same:
-                handler.conclude_request(
+            if user.verify_password(new_passwd):
+                return respond(
                     400,
-                    {},
                     "New password should not be the same",
+                    username=actor_username,
                 )
-                return
 
             user.set_password(
                 new_passwd, force_update_after_login=force_update_after_login
             )
-            # session.commit()
+            session.commit()
 
-        response = {
-            "code": 200,
-            "message": "Password set successfully",
-            "data": {},
-        }
-
-        handler.conclude_request(**response)
+        return respond(200, "Password set successfully", username=actor_username)
 
 
 class RequestManageUserStatusHandler(RequestHandler):
-    schema = {
-        "type": "object",
-        "properties": {
-            "status": {"enum": ["active", "disabled"]},
-            "username": {"type": "string", "minLength": 1},
-        },
-        "required": ["status", "username"],
-        "additionalProperties": False,
-    }
+    request_model = _ManageUserStatusRequest
 
     require_auth = True
+    rate_limit_cost = 3
 
     def handle(self, handler: ConnectionHandler):
         new_status: str = handler.data["status"]
         username: str = handler.data["username"]
+        reason: str | None = handler.data.get("reason")
+        reason_provided = "reason" in handler.data
 
         with Session() as session:
             this_user = User.get_existing(session, handler.username)
@@ -1232,13 +1186,44 @@ class RequestManageUserStatusHandler(RequestHandler):
                 handler.conclude_request(404, {}, "User does not exist")
                 return Result(code=404, target=None, username=handler.username)
 
-            if user.status == mapping[new_status]:
-                handler.conclude_request(400, {}, f"User is already {new_status}")
-                return Result(code=400, target=None, username=handler.username)
-            else:
+            previous_reason = user.status_reason
+            status_changed = user.status != mapping[new_status]
+            if status_changed:
                 user.status = mapping[new_status]
+                user.status_comment_id = (
+                    CommentStore.get_or_create_id(session, reason)
+                    if new_status == "disabled" and reason is not None
+                    else None
+                )
+            elif new_status == "disabled" and reason_provided:
+                if previous_reason != reason:
+                    user.status_comment_id = (
+                        CommentStore.get_or_create_id(session, reason)
+                        if reason is not None
+                        else None
+                    )
 
+            current_reason = (
+                reason
+                if new_status == "disabled" and (status_changed or reason_provided)
+                else previous_reason
+                if new_status == "disabled"
+                else None
+            )
             session.commit()
 
-        handler.conclude_request(200, {}, "User status updated successfully")
-        return Result(code=200, target=username, username=handler.username)
+        response_data = {
+            "username": username,
+            "status": new_status,
+            "reason": current_reason,
+        }
+        handler.conclude_request(200, response_data, "User status updated successfully")
+        return Result(
+            code=200,
+            target=username,
+            data={
+                "status": new_status,
+                **reason_change_audit_data(previous_reason, response_data["reason"]),
+            },
+            username=handler.username,
+        )

@@ -12,22 +12,49 @@ from include.database.models.identity import (
 from include.database.session import Session
 from include.domains.access.permissions import Permissions
 from include.domains.identity.commands.groups import create_group
-from include.domains.pagination import OFFSET_PAGINATION_SCHEMA, get_offset_pagination
+from include.domains.identity.permission_entries import serialize_permission_entries
+from include.domains.identity.request_models import (
+    OffsetPaginationRequest,
+    PermissionEntry,
+)
+from include.domains.pagination import get_offset_pagination
 from include.messages import Messages as smsg
 from include.transport.connection import ConnectionHandler
-from include.transport.request_handler import RequestHandler, Result
+from include.transport.request_handler import (
+    REQUEST_UNSET,
+    Omittable,
+    RequestDataModel,
+    RequestHandler,
+    Result,
+)
+from include.types import NonEmptyString
+
+
+class _CreateGroupRequest(RequestDataModel):
+    group_name: NonEmptyString
+    display_name: str | None = None
+    permissions: Omittable[list[PermissionEntry]] = REQUEST_UNSET
+
+
+class _GroupNameRequest(RequestDataModel):
+    group_name: NonEmptyString
+
+
+class _RenameGroupRequest(RequestDataModel):
+    group_name: NonEmptyString
+    display_name: str | None
+
+
+class _ChangeGroupPermissionsRequest(RequestDataModel):
+    group_name: NonEmptyString
+    permissions: list[PermissionEntry]
 
 
 class RequestListGroupsHandler(RequestHandler):
-    schema = {
-        "type": "object",
-        "properties": {
-            **OFFSET_PAGINATION_SCHEMA,
-        },
-        "additionalProperties": False,
-    }
+    request_model = OffsetPaginationRequest
 
     require_auth = True
+    rate_limit_cost = 3
 
     def handle(self, handler: ConnectionHandler):
         offset, count = get_offset_pagination(handler.data)
@@ -37,11 +64,9 @@ class RequestListGroupsHandler(RequestHandler):
 
             if Permissions.LIST_GROUPS not in user.all_permissions:
                 handler.conclude_request(
-                    **{
-                        "code": 403,
-                        "message": "You do not have permission to list groups",
-                        "data": {},
-                    }
+                    code=403,
+                    message="You do not have permission to list groups",
+                    data={},
                 )
                 return
 
@@ -61,7 +86,10 @@ class RequestListGroupsHandler(RequestHandler):
                         {
                             "name": group.group_name,
                             "display_name": group.group_display_name,
-                            "permissions": list(group.all_permissions),
+                            "permissions": serialize_permission_entries(
+                                group.permissions
+                            ),
+                            "effective_permissions": sorted(group.all_permissions),
                             "members": list(group.members),
                         }
                         for group in groups
@@ -77,30 +105,10 @@ class RequestListGroupsHandler(RequestHandler):
 
 
 class RequestCreateGroupHandler(RequestHandler):
-    schema = {
-        "type": "object",
-        "properties": {
-            "group_name": {"type": "string", "minLength": 1},
-            "display_name": {"anyOf": [{"type": "string"}, {"type": "null"}]},
-            "permissions": {
-                "type": "array",
-                "items": {
-                    "type": "object",
-                    "properties": {
-                        "permission": {"type": "string"},
-                        "start_time": {"type": "number"},
-                        "end_time": {"type": "number"},
-                    },
-                    "required": ["permission", "start_time"],
-                    "additionalProperties": False,
-                },
-            },
-        },
-        "required": ["group_name"],
-        "additionalProperties": False,
-    }
+    request_model = _CreateGroupRequest
 
     require_auth = True
+    rate_limit_cost = 3
 
     def handle(self, handler: ConnectionHandler):
         data = handler.data
@@ -138,16 +146,10 @@ class RequestCreateGroupHandler(RequestHandler):
 
 
 class RequestDeleteGroupHandler(RequestHandler):
-    schema = {
-        "type": "object",
-        "properties": {
-            "group_name": {"type": "string", "minLength": 1},
-        },
-        "required": ["group_name"],
-        "additionalProperties": False,
-    }
+    request_model = _GroupNameRequest
 
     require_auth = True
+    rate_limit_cost = 5
 
     def handle(self, handler: ConnectionHandler):
 
@@ -156,11 +158,9 @@ class RequestDeleteGroupHandler(RequestHandler):
 
             if Permissions.DELETE_GROUP not in this_user.all_permissions:
                 handler.conclude_request(
-                    **{
-                        "code": 403,
-                        "message": "You do not have permission to delete groups",
-                        "data": {},
-                    }
+                    code=403,
+                    message="You do not have permission to delete groups",
+                    data={},
                 )
                 return Result(
                     code=403,
@@ -173,11 +173,7 @@ class RequestDeleteGroupHandler(RequestHandler):
 
             if not group_to_delete:
                 handler.conclude_request(
-                    **{
-                        "code": 404,
-                        "message": "Group does not exist",
-                        "data": {},
-                    }
+                    code=404, message="Group does not exist", data={}
                 )
                 return Result(
                     code=404, target=group_to_delete_name, username=handler.username
@@ -217,17 +213,10 @@ class RequestDeleteGroupHandler(RequestHandler):
 
 
 class RequestRenameGroupHandler(RequestHandler):
-    schema = {
-        "type": "object",
-        "properties": {
-            "group_name": {"type": "string", "minLength": 1},
-            "display_name": {"anyOf": [{"type": "string"}, {"type": "null"}]},
-        },
-        "required": ["group_name", "display_name"],
-        "additionalProperties": False,
-    }
+    request_model = _RenameGroupRequest
 
     require_auth = True
+    rate_limit_cost = 5
 
     def handle(self, handler: ConnectionHandler):
 
@@ -238,11 +227,9 @@ class RequestRenameGroupHandler(RequestHandler):
 
             if Permissions.RENAME_GROUP not in this_user.all_permissions:
                 handler.conclude_request(
-                    **{
-                        "code": 403,
-                        "message": "You do not have permission to rename groups",
-                        "data": {},
-                    }
+                    code=403,
+                    message="You do not have permission to rename groups",
+                    data={},
                 )
                 return Result(
                     code=403, target=target_group_name, username=handler.username
@@ -251,22 +238,14 @@ class RequestRenameGroupHandler(RequestHandler):
             new_display_name: str | None = handler.data.get("display_name", None)
             if type(new_display_name) not in (str, None):
                 handler.conclude_request(
-                    **{
-                        "code": 400,
-                        "message": "display_name must be null or a string",
-                        "data": {},
-                    }
+                    code=400, message="display_name must be null or a string", data={}
                 )
                 return
 
             group_to_rename = session.get(UserGroup, target_group_name)
             if not group_to_rename:
                 handler.conclude_request(
-                    **{
-                        "code": 400,
-                        "message": "Group does not exist",
-                        "data": {},
-                    }
+                    code=400, message="Group does not exist", data={}
                 )
                 return
 
@@ -284,16 +263,10 @@ class RequestRenameGroupHandler(RequestHandler):
 
 
 class RequestGetGroupInfoHandler(RequestHandler):
-    schema = {
-        "type": "object",
-        "properties": {
-            "group_name": {"type": "string", "minLength": 1},
-        },
-        "required": ["group_name"],
-        "additionalProperties": False,
-    }
+    request_model = _GroupNameRequest
 
     require_auth = True
+    rate_limit_cost = 3
 
     def handle(self, handler: ConnectionHandler):
 
@@ -302,21 +275,15 @@ class RequestGetGroupInfoHandler(RequestHandler):
 
             if not handler.data["group_name"]:
                 handler.conclude_request(
-                    **{
-                        "code": 400,
-                        "message": "Group name is required",
-                        "data": {},
-                    }
+                    code=400, message="Group name is required", data={}
                 )
                 return
 
             if Permissions.GET_GROUP_INFO not in user.all_permissions:
                 handler.conclude_request(
-                    **{
-                        "code": 403,
-                        "message": "You do not have permission to view group info",
-                        "data": {},
-                    }
+                    code=403,
+                    message="You do not have permission to view group info",
+                    data={},
                 )
                 return Result(
                     code=403,
@@ -327,11 +294,7 @@ class RequestGetGroupInfoHandler(RequestHandler):
             group = session.get(UserGroup, handler.data["group_name"])
             if not group:
                 handler.conclude_request(
-                    **{
-                        "code": 404,
-                        "message": "Group does not exist",
-                        "data": {},
-                    }
+                    code=404, message="Group does not exist", data={}
                 )
                 return Result(
                     code=404,
@@ -345,7 +308,8 @@ class RequestGetGroupInfoHandler(RequestHandler):
                 "data": {
                     "name": group.group_name,
                     "display_name": group.group_display_name,
-                    "permissions": list(group.all_permissions),
+                    "permissions": serialize_permission_entries(group.permissions),
+                    "effective_permissions": sorted(group.all_permissions),
                     "members": list(group.members),
                 },
             }
@@ -357,23 +321,10 @@ class RequestGetGroupInfoHandler(RequestHandler):
 
 
 class RequestChangeGroupPermissionsHandler(RequestHandler):
-    schema = {
-        "type": "object",
-        "properties": {
-            "group_name": {"type": "string", "minLength": 1},
-            "permissions": {
-                "type": "array",
-                "items": {
-                    "type": "string",
-                    "additionalProperties": False,
-                },
-            },
-        },
-        "required": ["group_name", "permissions"],
-        "additionalProperties": False,
-    }
+    request_model = _ChangeGroupPermissionsRequest
 
     require_auth = True
+    rate_limit_cost = 3
 
     def handle(self, handler: ConnectionHandler):
 
@@ -382,21 +333,15 @@ class RequestChangeGroupPermissionsHandler(RequestHandler):
 
             if not handler.data["group_name"]:
                 handler.conclude_request(
-                    **{
-                        "code": 400,
-                        "message": "Group name is required",
-                        "data": {},
-                    }
+                    code=400, message="Group name is required", data={}
                 )
                 return
 
             if Permissions.SET_GROUP_PERMISSIONS not in user.all_permissions:
                 handler.conclude_request(
-                    **{
-                        "code": 403,
-                        "message": "You do not have permission to set group permissions",
-                        "data": {},
-                    }
+                    code=403,
+                    message="You do not have permission to set group permissions",
+                    data={},
                 )
                 return Result(
                     code=403,
@@ -407,11 +352,7 @@ class RequestChangeGroupPermissionsHandler(RequestHandler):
             group = session.get(UserGroup, handler.data["group_name"])
             if not group:
                 handler.conclude_request(
-                    **{
-                        "code": 404,
-                        "message": "Group does not exist",
-                        "data": {},
-                    }
+                    code=404, message="Group does not exist", data={}
                 )
                 return Result(
                     code=404,
@@ -420,22 +361,8 @@ class RequestChangeGroupPermissionsHandler(RequestHandler):
                 )
 
             new_permissions = handler.data.get("permissions", [])
-
-            # Check if all elements in new_permissions are of type str
-            if not all(isinstance(permission, str) for permission in new_permissions):
-                handler.conclude_request(
-                    **{
-                        "code": 400,
-                        "message": "All permissions must be of type str",
-                        "data": {},
-                    }
-                )
-                return
-
-            # Avoid unnecessary DB work.
-            if set(new_permissions) != group.all_permissions:
-                group.all_permissions = new_permissions
-                session.commit()
+            group.all_permissions = new_permissions
+            session.commit()
 
         response = {
             "code": 200,

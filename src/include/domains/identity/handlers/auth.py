@@ -1,84 +1,124 @@
 import time
 from typing import Any
 
+from pydantic import Field
+
 from include.config.settings import global_config
-from include.database.models.identity import User
+from include.database.models.identity import User, UserStatus
 from include.database.session import Session
+from include.domains.identity.password_auth import verify_password_or_dummy
 from include.domains.identity.sessions import build_login_success_data
+from include.domains.identity.types import RequestUsername
 from include.domains.identity.validators.passwords import check_passwd_requirements
 from include.domains.operations.commands.audit import log_audit
-from include.domains.security.guards.login import LoginGuard
-from include.exceptions.misc import (
-    UserNotActiveError,
-    UserTOTPFailedError,
-    UserTOTPRequiredError,
+from include.domains.security.guards.login import (
+    AuthFactor,
+    LoginGuard,
+    ThrottleDecision,
+    ThrottleScope,
 )
+from include.domains.security.types import TwoFactorToken
 from include.transport.client_address import get_client_ip
 from include.transport.connection import ConnectionHandler
-from include.transport.request_handler import RequestHandler, Result
+from include.transport.request_handler import (
+    REQUEST_UNSET,
+    EmptyRequestDataModel,
+    Omittable,
+    RequestDataModel,
+    RequestHandler,
+    Result,
+)
+from include.types import NonEmptyString
+
+
+class _LoginRequest(RequestDataModel):
+    username: RequestUsername
+    password: NonEmptyString
+    two_factor_token: Omittable[TwoFactorToken] = Field(
+        default=REQUEST_UNSET,
+        alias="2fa_token",
+    )
 
 
 class RequestLoginHandler(RequestHandler):
-    """
-    Handles user login requests.
-    """
+    """Authenticate a local user and issue a session token."""
 
-    schema = {
-        "type": "object",
-        "properties": {
-            "username": {"type": "string", "minLength": 1},
-            "password": {"type": "string", "minLength": 1},
-            "2fa_token": {"type": "string", "minLength": 1},
-        },
-        "required": ["username", "password"],
-        "additionalProperties": False,
-    }
+    request_model = _LoginRequest
+    rate_limit_cost = 5
 
     def handle(self, handler: ConnectionHandler):
         username: str = handler.data["username"]
         password: str = handler.data["password"]
         totp_token: str = handler.data.get("2fa_token", "")
-
         ip = get_client_ip(handler.stream.connection._ws)
 
         def respond(code: int, message: str, data: dict[str, Any] | None = None):
             handler.conclude_request(code=code, data=data or {}, message=message)
             return Result(code=code, target=username)
 
-        def fail(code: int, message: str):
-            # Throttle by both IP+username and IP-only
-            LoginGuard.report_failure(ip, username, max_attempts=5, ip_max_attempts=20)
-            return respond(code, message)
+        def throttled(decision: ThrottleDecision):
+            if decision.scope == ThrottleScope.BANNED_SUBNET:
+                return respond(403, "Access denied")
+            data = {}
+            if decision.retry_after_seconds is not None:
+                data["retry_after_seconds"] = decision.retry_after_seconds
+            return respond(
+                429, "Too many authentication attempts. Please try again later.", data
+            )
 
-        # Check access: both by IP+username and IP-only are checked simultaneously
-        if not LoginGuard.check_access(ip, username):
-            return respond(429, "Too many login attempts. Please try again later.")
+        password_access = LoginGuard.evaluate(ip, username, AuthFactor.PASSWORD)
+        if not password_access.allowed:
+            return throttled(password_access)
 
         cfg = global_config["security"]
-
         with Session() as session:
             user = session.get(User, username)
+            if not verify_password_or_dummy(user, password):
+                LoginGuard.report_failure(ip, username, AuthFactor.PASSWORD)
+                return respond(401, "Invalid credentials")
 
-            if not user:
-                return fail(401, "Invalid credentials")
+            assert user is not None
+            LoginGuard.report_success(ip, username, AuthFactor.PASSWORD)
 
-            try:
-                token = user.authenticate_and_create_token(
-                    password, totp_token=totp_token
+            if user.totp_enabled:
+                if not totp_token:
+                    return respond(
+                        202,
+                        "Two-factor authentication required",
+                        {"method": "totp"},
+                    )
+
+                # For different authentication factors, we evaluate the access
+                # separately to ensure that each factor is throttled independently.
+                totp_access = LoginGuard.evaluate(ip, username, AuthFactor.TOTP)
+
+                if not totp_access.allowed:
+                    return throttled(totp_access)
+                if not user.verify_totp(totp_token):
+                    LoginGuard.report_failure(ip, username, AuthFactor.TOTP)
+                    return respond(401, "Invalid two-factor authentication token")
+                LoginGuard.report_success(
+                    ip,
+                    username,
+                    AuthFactor.TOTP,
+                    completed_authentication=True,
                 )
-            except UserTOTPRequiredError:
+            else:
+                LoginGuard.report_success(
+                    ip,
+                    username,
+                    AuthFactor.PASSWORD,
+                    completed_authentication=True,
+                )
+
+            if user.status != UserStatus.ACTIVE:
                 return respond(
-                    202, "Two-factor authentication required", {"method": "totp"}
+                    4003,
+                    "User account is not active",
+                    {"reason": user.status_reason},
                 )
-            except UserTOTPFailedError:
-                return fail(401, "Invalid two-factor authentication token")
-            except UserNotActiveError:
-                return fail(4003, "User account is not active")
 
-            if not token:
-                return fail(401, "Invalid credentials")
-
-            LoginGuard.report_success(ip, username)
+            token = user.create_token_after_authentication(password)
 
             try:
                 check_passwd_requirements(
@@ -104,24 +144,11 @@ class RequestLoginHandler(RequestHandler):
 
 
 class RequestRefreshTokenHandler(RequestHandler):
-    """
-    Handles token refresh requests.
-    This util processes a token refresh request by validating the existing token and generating a new one if valid.
-    It sends an appropriate response back to the client, indicating success or failure.
-    Args:
-        handler (ConnectionHandler): The connection handler containing request data and methods for responding.
-    Response Codes:
-        200   - Token refreshed successfully, returns a new token in the response data.
-        400 - Missing or invalid token in the request.
-        500 - Internal server error, with the exception message.
-    """
-
-    schema = {"type": "object", "properties": {}, "additionalProperties": False}
+    request_model = EmptyRequestDataModel
     require_auth = True
+    rate_limit_cost = 2
 
     def handle(self, handler: ConnectionHandler):
-
-        # Parse the refresh token request
         old_token = handler.token
 
         with Session() as session:
@@ -153,5 +180,4 @@ class RequestRefreshTokenHandler(RequestHandler):
                     remote_address=handler.remote_address,
                 )
 
-        # Send the response back to the client
         handler.conclude_request(**response)

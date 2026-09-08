@@ -1,4 +1,9 @@
 from include.config.settings import global_config
+from include.config.validation import (
+    AdmissionControlPolicy,
+    S3StoragePolicy,
+    SchedulingPolicy,
+)
 from include.providers.manager import ProviderManager
 from include.providers.storage import LocalStorageProvider
 
@@ -14,13 +19,19 @@ def initialize_providers(config=global_config) -> None:
         case "s3":
             from include.providers.storage.s3 import S3StorageProvider
 
-            s3_cfg = config["s3"]
+            s3_policy = S3StoragePolicy.from_config(config)
             storage_provider = S3StorageProvider(
-                bucket_name=s3_cfg["bucket"],
-                endpoint_url=s3_cfg["endpoint_url"],
-                aws_access_key_id=s3_cfg["access_key_id"],
-                aws_secret_access_key=s3_cfg["secret_access_key"],
-                region_name=s3_cfg["region_name"],
+                bucket_name=s3_policy.bucket,
+                endpoint_url=s3_policy.endpoint_url,
+                aws_access_key_id=s3_policy.access_key_id,
+                aws_secret_access_key=s3_policy.secret_access_key,
+                region_name=s3_policy.region_name,
+                aws_session_token=s3_policy.session_token,
+                addressing_style=s3_policy.addressing_style,
+                max_pool_connections=(
+                    s3_policy.max_pool_connections
+                    or AdmissionControlPolicy.from_config(config).max_connections
+                ),
             )
         case _:
             raise ValueError(
@@ -51,6 +62,29 @@ def initialize_providers(config=global_config) -> None:
 
     ProviderManager().register(caching_provider)
 
+    match config["provider"].get("rate_limit", "memory"):
+        case "memory":
+            from include.providers.rate_limits import MemoryRateLimitProvider
+
+            rate_limit_provider = MemoryRateLimitProvider()
+        case "redis":
+            from include.providers.rate_limits import RedisRateLimitProvider
+
+            redis_cfg = config["redis"]
+            rate_limit_provider = RedisRateLimitProvider(
+                host=redis_cfg["host"],
+                port=redis_cfg.get("port", 6379),
+                password=redis_cfg.get("password", ""),
+                db=redis_cfg.get("db", 0),
+            )
+        case _:
+            raise ValueError(
+                "Unsupported rate-limit provider type: "
+                f"{config['provider']['rate_limit']}"
+            )
+
+    ProviderManager().register(rate_limit_provider)
+
     match config["provider"]["event_bus"]:
         case "local":
             from include.providers.events import LocalEventBusProvider
@@ -73,3 +107,21 @@ def initialize_providers(config=global_config) -> None:
             )
 
     ProviderManager().register(event_bus_provider)
+
+    match config["provider"].get("scheduling", "local"):
+        case "local":
+            from include.providers.scheduling import LocalSchedulingProvider
+
+            scheduling_provider = LocalSchedulingProvider(
+                SchedulingPolicy.from_config(config)
+            )
+        case "redis":
+            from include.providers.scheduling.redis import RedisSchedulingProvider
+
+            scheduling_provider = RedisSchedulingProvider.from_config(config)
+        case _:
+            raise ValueError(
+                "Unsupported scheduling provider type: "
+                f"{config['provider']['scheduling']}"
+            )
+    ProviderManager().register(scheduling_provider)

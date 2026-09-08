@@ -2,12 +2,13 @@ import secrets
 import time
 from typing import TYPE_CHECKING
 
-from sqlalchemy import VARCHAR, Boolean, Float, ForeignKey, Integer
+from sqlalchemy import VARCHAR, BigInteger, Boolean, Double, ForeignKey, Integer
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from include.database.session import Base
 
 if TYPE_CHECKING:
+    from include.database.models.comments import Comment
     from include.database.models.documents import Node
     from include.database.models.identity import User
 
@@ -24,16 +25,26 @@ class UserBlockEntry(Base):
     sub_entries: Mapped[list["UserBlockSubEntry"]] = relationship(
         "UserBlockSubEntry", back_populates="parent_entry", cascade="all, delete-orphan"
     )
-    timestamp: Mapped[float] = mapped_column(Float, nullable=False)
+    timestamp: Mapped[float] = mapped_column(Double, nullable=False)
 
-    not_before: Mapped[float] = mapped_column(Float, nullable=False)
-    not_after: Mapped[float] = mapped_column(Float, nullable=False)
+    not_before: Mapped[float] = mapped_column(Double, nullable=False)
+    not_after: Mapped[float] = mapped_column(Double, nullable=False)
 
     # Due to technical issues in the implementation of ORM, target_type and target_id are
     # stored as two separate columns, but when 'target_type' is 'all', target_id can be
     # left empty.
     target_type: Mapped[str] = mapped_column(VARCHAR(32), nullable=False)
     target_id: Mapped[str] = mapped_column(VARCHAR(255), nullable=True)
+    reason_comment_id: Mapped[int | None] = mapped_column(
+        BigInteger().with_variant(Integer, "sqlite"),
+        ForeignKey("comments.comment_id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    reason_comment: Mapped["Comment | None"] = relationship("Comment")
+
+    @property
+    def reason(self) -> str | None:
+        return self.reason_comment.comment_text if self.reason_comment else None
 
 
 class UserBlockSubEntry(Base):
@@ -71,8 +82,8 @@ class ObjectAccessEntry(Base):
     # read, write, move
     access_type: Mapped[str] = mapped_column(VARCHAR(16), nullable=False)
 
-    start_time: Mapped[float] = mapped_column(Float, nullable=False)
-    end_time: Mapped[float | None] = mapped_column(Float, nullable=True)
+    start_time: Mapped[float] = mapped_column(Double, nullable=False)
+    end_time: Mapped[float | None] = mapped_column(Double, nullable=True)
 
 
 class CompiledAccessRule(Base):
@@ -116,7 +127,7 @@ class CompiledAccessRuleSet(Base):
         index=True,
     )
     created_at: Mapped[float] = mapped_column(
-        Float, nullable=False, default=lambda: time.time()
+        Double, nullable=False, default=lambda: time.time()
     )
 
     node: Mapped["Node"] = relationship(

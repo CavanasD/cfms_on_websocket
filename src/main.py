@@ -1,29 +1,36 @@
 """
 Main entry module.
 
-Performs initialization checks when starting the CFMS WebSocket application:
-if the system has not been initialized, it creates the database tables, the
-default sysop permission group, and the administrator account, then writes the
-initialization marker; if it has already been initialized, it connects to the
-database directly and loads user information for later processing.
+Initializes a fresh database and seeds application data on first startup. Schema
+upgrades for existing databases remain explicit maintenance operations.
 """
 
 import os
 import socket
 import ssl
 import sys
+from collections.abc import Generator
+from contextlib import contextmanager
 
 from loguru import logger
-from websockets.sync.server import serve
+from websockets.sync.server import Server, serve
 
 import include.database.models  # noqa: F401
 from include.config.constants import (
     CORE_VERSION,
     DEFAULT_SSL_CERT_VALIDITY_DAYS,
-    ROOT_ABSPATH,
+    FILE_TASK_EVENT_CHANNEL,
+    GLOBAL_BROADCAST_EVENT_CHANNEL,
+    LOGIN_GUARD_EVENT_CHANNEL,
     ROOT_DIRECTORY_ID,
 )
+from include.config.paths import (
+    EXECUTABLE_ABSPATH,
+    EXTENSION_ROOT,
+)
 from include.config.settings import global_config
+from include.config.validation import get_config_warnings, get_enabled_extensions
+from include.database.initialization import initialize_database_schema
 from include.database.models.documents import (
     Document,
     DocumentMetadata,
@@ -35,27 +42,34 @@ from include.database.session import Base, Session, engine
 from include.domains.access.authorization.access_rules import set_access_rules
 from include.domains.access.permissions import Permissions
 from include.domains.drive.homes import ensure_home_parent
+from include.domains.documents.file_task_signals import on_file_task_event
 from include.domains.operations.broadcast import on_global_broadcast
 from include.domains.security.guards.login import LoginGuard
+from include.domains.security.guards.request_rate_control import (
+    validate_handler_rate_limit_costs,
+)
 from include.domains.security.handlers.debugging import RequestThrowExceptionHandler
 from include.extensions.manager import (
-    load_builtin_extension,
+    collect_scheduled_tasks,
     load_extensions_from_directory,
     pm,
 )
 from include.providers.bootstrap import initialize_providers
 from include.providers.manager import ProviderManager
-from include.transport.client_address import is_v6_address
+from include.runtime_lock import RuntimeLockError, server_runtime_lock
+from include.transport.client_address import get_bind_options
 from include.transport.request_entrypoint import global_process_request
+from include.transport.request_handler import validate_request_handler_models
 from include.transport.router import (
     available_functions,
     handle_connection,
     whitelisted_functions,
 )
+from include.transport.tls import create_server_ssl_context
 
 # fix
-os.makedirs(ROOT_ABSPATH / "content" / "logs", exist_ok=True)
-os.makedirs(ROOT_ABSPATH / "content" / "ssl", exist_ok=True)
+os.makedirs(EXECUTABLE_ABSPATH / "content" / "logs", exist_ok=True)
+os.makedirs(EXECUTABLE_ABSPATH / "content" / "ssl", exist_ok=True)
 
 
 def ensure_root_folder():
@@ -105,14 +119,7 @@ def server_init():
 
     from include.domains.identity.commands.groups import create_group
 
-    if (
-        os.path.exists(ROOT_ABSPATH / "app.db")
-        and global_config["database"]["type"] == "sqlite"
-    ):
-        os.remove(ROOT_ABSPATH / "app.db")
-
-    # Create database tables before inserting data
-    Base.metadata.create_all(engine)
+    initialize_database_schema(engine, Base.metadata)
 
     # Ensure the root folder exists before seeding any objects that reference it.
     ensure_root_folder()
@@ -141,6 +148,7 @@ def server_init():
             {"permission": Permissions.SET_ACCESS_RULES},
             {"permission": Permissions.VIEW_ACCESS_RULES},
             {"permission": Permissions.MANAGE_ACCESS},
+            {"permission": Permissions.SEARCH},
         ],
     )
     create_group(
@@ -158,6 +166,9 @@ def server_init():
             {"permission": Permissions.DELETE_DIRECTORY},
             {"permission": Permissions.RENAME_DIRECTORY},
             {"permission": Permissions.MANAGE_SYSTEM},
+            {"permission": Permissions.DIAGNOSTICS},
+            {"permission": Permissions.VIEW_SCHEDULES},
+            {"permission": Permissions.MANAGE_SCHEDULES},
             {"permission": Permissions.CREATE_USER},
             {"permission": Permissions.DELETE_USER},
             {"permission": Permissions.RENAME_USER},
@@ -178,6 +189,9 @@ def server_init():
             {"permission": Permissions.RENAME_GROUP},
             {"permission": Permissions.SET_GROUP_PERMISSIONS},
             {"permission": Permissions.BYPASS_LOCKDOWN},
+            {"permission": Permissions.BYPASS_DOCUMENT_CREATION_RATE_LIMIT},
+            {"permission": Permissions.BYPASS_DOCUMENT_DOWNLOAD_RATE_LIMIT},
+            {"permission": Permissions.BYPASS_REQUEST_RATE_LIMIT},
             {"permission": Permissions.APPLY_LOCKDOWN},
             {"permission": Permissions.VIEW_AUDIT_LOGS},
             {"permission": Permissions.MANAGE_ACCESS},
@@ -193,19 +207,26 @@ def server_init():
             {"permission": Permissions.DELETE_REVISION},
             {"permission": Permissions.MANAGE_KEYRINGS},
             {"permission": Permissions.LIST_USER_BLOCKS},
+            {"permission": Permissions.LIST_BANNED_SUBNETS},
+            {"permission": Permissions.MANAGE_BANNED_SUBNETS},
+            {"permission": Permissions.LIST_AUTH_LOCKOUTS},
+            {"permission": Permissions.UNLOCK_AUTH_LOCKOUTS},
             {"permission": Permissions.PURGE},
             {"permission": Permissions.RESTORE},
             {"permission": Permissions.LIST_DELETED_ITEMS},
+            {"permission": Permissions.SUPER_RENAME_USER},
+            {"permission": Permissions.SET_USER_AVATAR},
         ],
     )
 
-    # Initialize providers
+    # Initialize providers, since we need to use the storage provider later.
     initialize_providers()
 
-    # Add sample file and document
-    sample_source_path = "content/hello"
+    # Read from sample document source and write back to storage.
+    # This is necessary because the storage provider cannot be determined in advance.
+    sample_source_path = EXECUTABLE_ABSPATH / "content" / "hello"
 
-    today = datetime.date.today()
+    today = datetime.datetime.now(datetime.UTC).date()
     real_filename = secrets.token_hex(32)
     sample_target_path = f"content/files/{today.year}/{today.month}/{real_filename}"
 
@@ -214,9 +235,11 @@ def server_init():
         os.path.dirname(sample_target_path), exist_ok=True
     )
 
-    with open(sample_source_path, "rb") as source:
-        with ProviderManager().storage.fopen(sample_target_path, "wb") as f:
-            f.write(source.read())
+    with (
+        open(sample_source_path, "rb") as source,
+        ProviderManager().storage.fopen(sample_target_path, "wb") as f,
+    ):
+        f.write(source.read())
 
     with Session() as session:
         # not using `ROOT_ABSPATH` here to allow easy migration
@@ -262,10 +285,15 @@ def server_init():
     )
 
     # Write the generated password to admin_password.txt in the project root.
-    with open(ROOT_ABSPATH / "admin_password.txt", "w", encoding="utf-8") as pwd_file:
+    with open(
+        EXECUTABLE_ABSPATH / "admin_password.txt", "w", encoding="utf-8"
+    ) as pwd_file:
         pwd_file.write(f"{password}\n")
 
-    os.makedirs(ROOT_ABSPATH / "content", exist_ok=True)
+    # Logs, certificates, and private keys are all stored on the server's file system;
+    # therefore, the `os` library is used for read/write operations instead of
+    # `StorageProvider`.
+    os.makedirs(EXECUTABLE_ABSPATH / "content", exist_ok=True)
 
     import datetime
 
@@ -297,9 +325,9 @@ def server_init():
             .issuer_name(issuer)
             .public_key(private_key.public_key())
             .serial_number(x509.random_serial_number())
-            .not_valid_before(datetime.datetime.now(datetime.timezone.utc))
+            .not_valid_before(datetime.datetime.now(datetime.UTC))
             .not_valid_after(
-                datetime.datetime.now(datetime.timezone.utc)
+                datetime.datetime.now(datetime.UTC)
                 + datetime.timedelta(days=DEFAULT_SSL_CERT_VALIDITY_DAYS)
             )
             .add_extension(
@@ -325,7 +353,7 @@ def server_init():
         with open(cert_path, "wb") as f:
             f.write(cert.public_bytes(serialization.Encoding.PEM))
 
-    with open(ROOT_ABSPATH / "init", "w") as f:
+    with open(EXECUTABLE_ABSPATH / "init", "w") as f:
         f.write("This file indicates that the database has been initialized.\n")
 
 
@@ -340,13 +368,14 @@ def prepare_handlers():
     It also populates the `whitelisted_functions` list with actions that are
     allowed even during lockdown.
     """
-
-    # Debugging
-    if global_config["debug"]:
+    if global_config["debug"]:  # Debugging
         available_functions["throw_exception"] = RequestThrowExceptionHandler
 
     # Load available request handlers from extensions
     extension_handlers = pm.hook.ext_register_handlers()
+
+    # If multiple extensions attempt to register the same action, the behavior is
+    # undefined.
     for handler_dict in extension_handlers:
         available_functions.update(handler_dict)
 
@@ -356,8 +385,15 @@ def prepare_handlers():
             if handler_name in available_functions:
                 del available_functions[handler_name]
 
+    validate_request_handler_models(available_functions)
+
     for ext_whitelisted_actions in pm.hook.ext_register_whitelisted_actions():
         whitelisted_functions.extend(ext_whitelisted_actions)
+
+    for action in validate_handler_rate_limit_costs(available_functions):
+        logger.warning(
+            f"Configured request rate-limit cost references unknown action {action!r}"
+        )
 
 
 def prepare_logger():
@@ -371,7 +407,7 @@ def prepare_logger():
     The log file is located at "./content/logs/server.log".
     """
 
-    log_file = ROOT_ABSPATH / "content" / "logs" / "server.log"
+    log_file = EXECUTABLE_ABSPATH / "content" / "logs" / "server.log"
     fmt = "[<green>{time:YYYY-MM-DD HH:mm:ss,SSS}</green> <level>{level: <8}</level>] <level>{message}</level>"
 
     # reset default logger to avoid conflicts with loguru's configuration
@@ -394,62 +430,48 @@ def prepare_logger():
     )
 
 
-def main():
+@contextmanager
+def _server_lifecycle(server: Server) -> Generator[None]:
+    try:
+        pm.hook.ext_on_startup(server=server)
+        ProviderManager().scheduling.start(collect_scheduled_tasks())
+        yield
+    finally:
+        try:
+            ProviderManager().scheduling.shutdown()
+        finally:
+            pm.hook.ext_on_shutdown()
+
+
+def _run_server():
     prepare_logger()
 
-    if not os.path.exists(ROOT_ABSPATH / "init"):
+    if not os.path.exists(EXECUTABLE_ABSPATH / "init"):
         logger.info("Database not initialized, initializing now...")
         server_init()
 
     logger.info("Initializating CFMS WebSocket server...")
     logger.info(f"CFMS Core Version: {CORE_VERSION}")
-    ssl_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-    ssl_context.load_cert_chain(
-        certfile=global_config["server"]["ssl_certfile"],
-        keyfile=global_config["server"]["ssl_keyfile"],
-    )
-    ssl_context.minimum_version = ssl.TLSVersion.TLSv1_3
 
-    # Mutual TLS: require and verify client certificates if configured
+    # TODO: Add support for TLS ECH when upstream libraries support it.
     security_cfg = global_config.get("security", {})
-    if security_cfg.get("require_client_cert", False):
-        client_ca_path: str = security_cfg["client_cert_ca_path"]
-        if not os.path.exists(client_ca_path) or not os.path.isdir(client_ca_path):
-            logger.error(
-                "Client certificate CA path not found or is not a dir: "
-                f"{client_ca_path}. Cannot enable client certificate "
-                "verification. Please provide a valid CA certificate "
-                "path or disable 'require_client_cert' in the configuration."
-            )
-            raise SystemExit(1)
-        ssl_context.verify_mode = ssl.CERT_REQUIRED
-
-        ssl_context.verify_flags |= ssl.VERIFY_X509_STRICT
-        # ssl_context.verify_flags |= ssl.VERIFY_CRL_CHECK_LEAF
-        # ssl_context.verify_flags |= ssl.VERIFY_CRL_CHECK_CHAIN
-
-        ssl_context.load_verify_locations(capath=client_ca_path)
+    require_client_cert = security_cfg.get("require_client_cert", False)
+    ssl_context = create_server_ssl_context(
+        global_config["server"]["ssl_certfile"],
+        global_config["server"]["ssl_keyfile"],
+        require_client_cert=require_client_cert,
+        client_ca_path=(
+            security_cfg["client_cert_ca_path"] if require_client_cert else None
+        ),
+    )
+    if require_client_cert:
         logger.info(
             f"Mutual TLS enabled: client certificates will be verified "
-            f"against CA path '{client_ca_path}'."
+            f"against CA path '{security_cfg['client_cert_ca_path']}'."
         )
 
-    if not security_cfg["pepper"]:
-        logger.warning(
-            "Setting the value for `pepper` to empty in the configuration "
-            "file can lead to potential security vulnerabilities. For "
-            "details, see: https://cheatsheetseries.owasp.org/cheatsheets/"
-            "Password_Storage_Cheat_Sheet.html#peppering"
-        )
-
-    if sys.version_info < (3, 14):
-        logger.warning(
-            "Support for Python 3.13 in CFMS 0.4 is set to end in early "
-            "October 2026. To continue running the latest version of CFMS, "
-            "it is recommended that you upgrade to Python 3.14 as soon as "
-            "possible, and subsequently upgrade to Python 3.15 promptly "
-            "after its release."
-        )
+    for warning in get_config_warnings(global_config):
+        logger.warning(warning)
 
     if ssl.OPENSSL_VERSION_INFO < (3, 5):
         logger.warning(
@@ -461,22 +483,26 @@ def main():
             "OpenSSL 3.5 or later to resolve this issue."
         )
 
-    # Always create tables that do not exist
-    Base.metadata.create_all(engine)
-
     # Ensure the root folder record exists (handles upgrades from older versions)
     ensure_root_folder()
 
-    # Initialize Providers
     initialize_providers()
 
     # Register global broadcast handler
-    ProviderManager().event_bus.subscribe("system:broadcast", on_global_broadcast)
+    ProviderManager().event_bus.subscribe(
+        GLOBAL_BROADCAST_EVENT_CHANNEL, on_global_broadcast
+    )
+    ProviderManager().event_bus.subscribe(
+        LOGIN_GUARD_EVENT_CHANNEL, LoginGuard.handle_event
+    )
+    ProviderManager().event_bus.subscribe(FILE_TASK_EVENT_CHANNEL, on_file_task_event)
 
-    # Register plugins after database initialization
-    extension_root = ROOT_ABSPATH / "include" / "extensions"
-    load_builtin_extension(extension_root)
-    load_extensions_from_directory(extension_root)
+    # Register extensions after database initialization
+    load_extensions_from_directory(
+        EXTENSION_ROOT,
+        get_enabled_extensions(global_config),
+        config=global_config,
+    )
 
     # Initialize available request handlers
     prepare_handlers()
@@ -486,24 +512,44 @@ def main():
 
     host = global_config["server"]["host"]
     port = global_config["server"]["port"]
-    socket_family = socket.AF_INET6 if is_v6_address(host) else socket.AF_INET
-    host_address = f"[{host}]" if is_v6_address(host) else host
+    socket_family, dualstack_ipv6 = get_bind_options(
+        host, global_config["server"]["dualstack_ipv6"]
+    )
 
-    with serve(
-        handle_connection,
-        host,
-        port,
-        ssl=ssl_context,
-        family=socket_family,
-        dualstack_ipv6=(
-            global_config["server"]["dualstack_ipv6"]
-            if socket_family == socket.AF_INET6
-            else False
-        ),
-        process_request=global_process_request,
-    ) as server:
-        logger.info(f"CFMS WebSocket server started at wss://{host_address}:{port}")
-        server.serve_forever()
+    try:
+        with serve(
+            handle_connection,
+            host,
+            port,
+            ssl=ssl_context,
+            family=socket_family,
+            dualstack_ipv6=dualstack_ipv6,
+            process_request=global_process_request,
+        ) as server:
+            bound_address = server.socket.getsockname()
+            bound_host = bound_address[0]
+            display_host = (
+                f"[{bound_host}]"
+                if server.socket.family == socket.AF_INET6
+                else bound_host
+            )
+            with _server_lifecycle(server):
+                logger.info(
+                    "CFMS WebSocket server started at "
+                    f"wss://{display_host}:{bound_address[1]}"
+                )
+                server.serve_forever()
+    finally:
+        global_config.stop()
+
+
+def main():
+    try:
+        with server_runtime_lock(EXECUTABLE_ABSPATH):
+            _run_server()
+    except RuntimeLockError as exc:
+        logger.error(str(exc))
+        raise SystemExit(1) from exc
 
 
 if __name__ == "__main__":

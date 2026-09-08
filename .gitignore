@@ -56,9 +56,11 @@ src/content/files/
 src/content/logs/*
 
 .idea
-uv.lock
 tests/*_old.py
 
 # Node.js
 package-lock.json
 package.json
+
+# Server runtime
+*.lock

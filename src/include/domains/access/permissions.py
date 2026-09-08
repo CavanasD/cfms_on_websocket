@@ -20,6 +20,9 @@ class Permissions(StrEnum):
     RESTORE = "restore"
     """permission to restore documents/directories from deletion."""
 
+    SEARCH = "search"
+    """permission to search for documents/directories."""
+
     # Super operations
     SUPER_CREATE_DOCUMENT = "super_create_document"
     SUPER_CREATE_DIRECTORY = "super_create_directory"
@@ -35,6 +38,9 @@ class Permissions(StrEnum):
     tasks that have not been assigned to other specific permissions.
     """
     DEBUGGING = "debugging"
+    DIAGNOSTICS = "diagnostics"
+    VIEW_SCHEDULES = "view_schedules"
+    MANAGE_SCHEDULES = "manage_schedules"
 
     # User management
     CREATE_USER = "create_user"
@@ -46,6 +52,9 @@ class Permissions(StrEnum):
     MANAGE_2FA = "manage_2fa"
     SET_PASSWD = "set_passwd"
     SET_USER_PERMISSIONS = "set_user_permissions"
+    SET_USER_AVATAR = "set_user_avatar"
+
+    SUPER_RENAME_USER = "super_rename_user"
 
     # Group management
     CREATE_GROUP = "create_group"
@@ -65,9 +74,16 @@ class Permissions(StrEnum):
     VIEW_ACCESS_ENTRIES = "view_access_entries"
     APPLY_LOCKDOWN = "apply_lockdown"
     BYPASS_LOCKDOWN = "bypass_lockdown"
+    BYPASS_DOCUMENT_CREATION_RATE_LIMIT = "bypass_document_creation_rate_limit"
+    BYPASS_DOCUMENT_DOWNLOAD_RATE_LIMIT = "bypass_document_download_rate_limit"
+    BYPASS_REQUEST_RATE_LIMIT = "bypass_request_rate_limit"
     BLOCK = "block"
     UNBLOCK = "unblock"
     LIST_USER_BLOCKS = "list_user_blocks"
+    LIST_BANNED_SUBNETS = "list_banned_subnets"
+    MANAGE_BANNED_SUBNETS = "manage_banned_subnets"
+    LIST_AUTH_LOCKOUTS = "list_auth_lockouts"
+    UNLOCK_AUTH_LOCKOUTS = "unlock_auth_lockouts"
 
     # Logs and version control
     VIEW_AUDIT_LOGS = "view_audit_logs"

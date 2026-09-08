@@ -1,39 +1,58 @@
-import time
+from typing import Self
 
-import orjson
-from sqlalchemy import and_, desc, or_, true, update
+from pydantic import model_validator
+from sqlalchemy import and_, desc, or_, true
 
-from include.database.models.files import FileTask
 from include.database.models.identity import User
 from include.database.models.operations import AuditEntry
 from include.database.session import Session
 from include.domains.access.permissions import Permissions
+from include.domains.operations.comments import reason_change_audit_data
+from include.domains.operations.lockdown import LockdownReason, apply_lockdown
 from include.domains.pagination import (
-    CURSOR_PAGINATION_SCHEMA,
     CursorError,
     PaginationCursor,
+    PaginationCursorToken,
+    PaginationPageSize,
     get_page_size,
     make_cursor_response,
 )
 from include.messages import Messages as smsg
-from include.shared import lockdown_enabled
 from include.transport.connection import ConnectionHandler
-from include.transport.request_handler import RequestHandler, Result
+from include.transport.request_handler import (
+    REQUEST_UNSET,
+    Omittable,
+    RequestDataModel,
+    RequestHandler,
+    Result,
+)
+
+
+class _LockdownRequest(RequestDataModel):
+    status: bool
+    reason: Omittable[LockdownReason | None] = REQUEST_UNSET
+
+    @model_validator(mode="after")
+    def reject_reason_when_disabling(self) -> Self:
+        if not self.status and "reason" in self.model_fields_set:
+            raise ValueError("reason is not allowed when disabling lockdown")
+        return self
+
+
+class _ViewAuditLogsRequest(RequestDataModel):
+    page_size: Omittable[PaginationPageSize] = REQUEST_UNSET
+    cursor: PaginationCursorToken | None = None
+    filters: Omittable[list[str]] = REQUEST_UNSET
 
 
 class RequestLockdownHandler(RequestHandler):
-    schema = {
-        "type": "object",
-        "properties": {"status": {"type": "boolean"}},
-        "required": ["status"],
-        "additionalProperties": False,
-    }
+    request_model = _LockdownRequest
 
     require_auth = True
+    rate_limit_cost = 10
 
     def handle(self, handler: ConnectionHandler):
         status_to_change: bool = handler.data["status"]
-
         with Session() as session:
             user = User.get_existing(session, handler.username)
 
@@ -41,45 +60,32 @@ class RequestLockdownHandler(RequestHandler):
                 handler.conclude_request(403, {}, smsg.ACCESS_DENIED)
                 return Result(code=403, target=None, username=handler.username)
 
-            if status_to_change:
-                lockdown_enabled.set()
-
-                # cancel all pending file tasks to prevent new file
-                # operations during lockdown.
-                now = time.time()
-                stmt = (
-                    update(FileTask)
-                    .where(FileTask.status == 0, FileTask.end_time >= now)
-                    .values(status=2)
-                )
-                session.execute(stmt)
-                session.commit()
-            else:
-                lockdown_enabled.clear()
-
-        handler.conclude_request(200, {}, smsg.SUCCESS)
-        handler.broadcast(
-            orjson.dumps(
-                {
-                    "event": "lockdown",
-                    "data": {"status": lockdown_enabled.is_set()},
-                }
-            )
+        transition = (
+            apply_lockdown(status_to_change, handler.data["reason"])
+            if "reason" in handler.data
+            else apply_lockdown(status_to_change)
         )
-        return Result(code=0, target=None, username=handler.username)
+
+        response_data = transition.state.as_response_data()
+        handler.conclude_request(200, response_data, smsg.SUCCESS)
+        return Result(
+            code=0,
+            target=None,
+            data={
+                **response_data,
+                **reason_change_audit_data(
+                    transition.previous_state.reason,
+                    transition.state.reason,
+                ),
+            },
+            username=handler.username,
+        )
 
 
 class RequestViewAuditLogsHandler(RequestHandler):
-    schema = {
-        "type": "object",
-        "properties": {
-            **CURSOR_PAGINATION_SCHEMA,
-            "filters": {"type": "array", "items": {"type": "string"}},
-        },
-        "required": [],
-        "additionalProperties": False,
-    }
+    request_model = _ViewAuditLogsRequest
     require_auth = True
+    rate_limit_cost = 3
 
     def handle(self, handler: ConnectionHandler):
         page_size = get_page_size(handler.data)

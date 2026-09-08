@@ -53,17 +53,17 @@ def fetch_subtree_for_deletion(
 
     subtree_sql = text(f"""
         WITH RECURSIVE subtree(id, parent_id, status) AS (
-            SELECT f.id, f.parent_id, n.status
+            SELECT f.id, n.parent_id, n.status
             FROM folders f
             INNER JOIN nodes n ON n.id = f.id
             WHERE f.id = :root_id
 
             UNION ALL
 
-            SELECT f.id, f.parent_id, n.status
+            SELECT f.id, n.parent_id, n.status
             FROM folders f
             INNER JOIN nodes n ON n.id = f.id
-            INNER JOIN subtree s ON f.parent_id = s.id
+            INNER JOIN subtree s ON n.parent_id = s.id
             WHERE 1=1 {status_filter}
         )
         SELECT id FROM subtree WHERE id != :root_id
@@ -281,9 +281,8 @@ def fetch_subtree_for_deletion(
         is_active = (
             doc.current_revision is not None and doc.current_revision.file.active
         )
-        if is_active and doc.id not in deletable_doc_ids:
-            if doc.folder_id:
-                folder_has_undeletable_doc[doc.folder_id] = True
+        if is_active and doc.id not in deletable_doc_ids and doc.folder_id:
+            folder_has_undeletable_doc[doc.folder_id] = True
 
     for fid in topo_order:
         self_undeletable = not folder_self_deletable.get(fid, True)

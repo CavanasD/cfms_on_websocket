@@ -1,10 +1,12 @@
 [project]
 name = "cfms-on-websocket"
-version = "0.3.0"
+version = "0.8.0"
 description = "The server-side program for CFMS on WebSocket, a WebSocket-based implementation of the CFMS protocol."
 readme = "README.md"
-requires-python = ">=3.13"
+requires-python = ">=3.14"
 dependencies = [
+    "alembic>=1.18.4",
+    "apscheduler>=3.11.3,<4",
     "argon2-cffi>=25.1.0",
     "cryptography>=46.0.3",
     "filetype>=1.2.0",
@@ -17,12 +19,14 @@ dependencies = [
     "websockets>=15.0.1",
     "pywin32; sys_platform == 'win32'",
     "orjson>=3.11.7",
+    "packaging>=26.3",
     "pluggy>=1.6.0",
     "loguru>=0.7.3",
     "watchdog>=6.0.0",
     "rich>=15.0.0",
     "redis>=7.4.0",
     "typer>=0.26.7",
+    "pydantic>=2.13.4",
 ]
 
 [project.scripts]
@@ -35,9 +39,19 @@ cluster = [
 mysql = [
     "mysql-connector-python>=9.6.0",
 ]
+postgresql = [
+    "psycopg2-binary>=2.9.12",
+]
 ext_oidc_sso = [
     "authlib>=1.7.2",
     "requests>=2.34.2",
+]
+ext_http_api = [
+    "fastapi>=0.141.1",
+    "uvicorn>=0.52.4",
+]
+ext-scheduling-cluster = [
+    "dramatiq[redis]>=2.2,<3",
 ]
 
 [dependency-groups]
@@ -45,8 +59,10 @@ dev = [
     "pytest>=8.0.0",
     "pytest-asyncio>=0.21.0",
     "pytest-timeout>=2.4.0",
-    "alembic>=1.18.4",
+    "httpx>=0.28.1",
     "pre-commit>=4.5.1",
+    "towncrier>=25.8.0",
+    "types-boto3[s3]>=1.43.66",
 ]
 
 [build-system]
@@ -75,12 +91,43 @@ ignore = [
     "D102", # Missing docstring in public method
     "D103", # Missing docstring in public function
 ]
-extend-select = ["I"] # , "D"
+extend-select = ["I", "UP"] # , "D"
 
 [tool.ruff.lint.per-file-ignores]
 "__init__.py" = ["F401", "F403"]  # allow `import *` in `__init__.py` for better package structuring
-"src/include/database/models/*" = ["E711", "E712"] # allow `== None` and `== True` in database models
+"src/include/database/models/*" = ["E711", "E712", "UP037"] # allow `== None`, `== True`, and quoted ORM forward references
+"src/include/extensions/*" = ["UP037"] # pluggy evaluates hook annotations at runtime
+"src/include/extensions/manager.py" = ["UP037"] # pluggy evaluates hook annotations at runtime
+"src/maintenance/operations/backups.py" = ["UP037"] # imported lazily to avoid loading backup providers
 "tests/*" = ["E722", "F841"]  # allow bare `except:` in tests for better error detection
 
 [tool.ruff.lint.isort]
 known-first-party = ["include", "maintenance"]
+
+[tool.towncrier]
+directory = "changelog.d"
+filename = "CHANGELOG.md"
+start_string = "<!-- towncrier release notes start -->\n"
+title_format = "## [v{version}](https://github.com/cfms-dev/cfms_on_websocket/releases/tag/v{version}) - {project_date}"
+issue_format = "[#{issue}](https://github.com/cfms-dev/cfms_on_websocket/issues/{issue})"
+underlines = ["", "", ""]
+ignore = []
+wrap = false
+
+[[tool.towncrier.type]]
+name = "Security"
+
+[[tool.towncrier.type]]
+name = "Removed"
+
+[[tool.towncrier.type]]
+name = "Deprecated"
+
+[[tool.towncrier.type]]
+name = "Added"
+
+[[tool.towncrier.type]]
+name = "Changed"
+
+[[tool.towncrier.type]]
+name = "Fixed"

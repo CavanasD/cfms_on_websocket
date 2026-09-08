@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 import secrets
 import time
 from collections.abc import Callable, Iterable
@@ -16,8 +14,9 @@ from sqlalchemy import (
     VARCHAR,
     BigInteger,
     Boolean,
-    Float,
+    Double,
     ForeignKey,
+    Index,
     Integer,
     Text,
     event,
@@ -25,16 +24,14 @@ from sqlalchemy import (
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 from sqlalchemy.orm.session import object_session
 
-from include.config.constants import DEFAULT_TOKEN_EXPIRY_SECONDS
+from include.config.constants import (
+    DEFAULT_TOKEN_EXPIRY_SECONDS,
+    USERNAME_DATABASE_MAX_LENGTH,
+)
 from include.config.settings import global_config
 from include.database.session import Base, Session
 from include.domains.access.permissions import Permissions
 from include.domains.identity.tokens import Token
-from include.exceptions.misc import (
-    UserNotActiveError,
-    UserTOTPFailedError,
-    UserTOTPRequiredError,
-)
 
 # Module-level PasswordHasher instance — reused across all calls to avoid
 # repeated construction overhead.
@@ -43,6 +40,7 @@ _password_hasher = PasswordHasher()
 if TYPE_CHECKING:
     from include.database.models.access import UserBlockEntry
     from include.database.models.documents import Folder
+    from include.database.models.comments import Comment
     from include.database.models.files import File
     from include.database.models.keyrings import UserKey
     from include.database.models.operations import AuditEntry
@@ -63,6 +61,8 @@ def _permission_grants_and_revocations(
     revoked_permissions = set()
 
     for entry in permission_entries:
+        if entry.start_time is not None and entry.start_time > now:
+            continue
         if entry.end_time is not None and entry.end_time < now:
             continue
 
@@ -84,16 +84,15 @@ def _effective_permissions(
 def _replace_permission_entries(
     session,
     current_entries: list[Any],
-    new_permission_list: list[str],
-    create_entry: Callable[[str, float], Any],
+    new_permission_entries: list[dict[str, Any]],
+    create_entry: Callable[[dict[str, Any]], Any],
 ) -> None:
     for old_permission in list(current_entries):
         session.delete(old_permission)
     current_entries.clear()
 
-    now = time.time()
-    for permission_name in new_permission_list:
-        permission = create_entry(permission_name, now)
+    for entry_data in new_permission_entries:
+        permission = create_entry(entry_data)
         session.add(permission)
         current_entries.append(permission)
 
@@ -101,22 +100,30 @@ def _replace_permission_entries(
 class User(Base):
     __tablename__ = "users"
     # id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    username: Mapped[str] = mapped_column(VARCHAR(64), primary_key=True)
+    username: Mapped[str] = mapped_column(
+        VARCHAR(USERNAME_DATABASE_MAX_LENGTH), primary_key=True
+    )
     pass_hash: Mapped[str] = mapped_column(Text)
     passwd_last_modified: Mapped[float] = mapped_column(
-        Float, default=0, nullable=False
+        Double, default=0, nullable=False
     )
     nickname: Mapped[str | None] = mapped_column(VARCHAR(255), nullable=True)
 
-    avatar_id: Mapped[str | None] = mapped_column(ForeignKey("files.id"), nullable=True)
-    avatar: Mapped[File | None] = relationship("File")
+    avatar_id: Mapped[str | None] = mapped_column(
+        ForeignKey("files.id"), nullable=True, index=True
+    )
+    avatar: Mapped["File | None"] = relationship("File")
 
-    last_login: Mapped[float | None] = mapped_column(Float)
-    created_time: Mapped[float | None] = mapped_column(Float, nullable=False)
+    last_login: Mapped[float | None] = mapped_column(Double)
+    created_time: Mapped[float | None] = mapped_column(Double, nullable=False)
 
-    status: Mapped[UserStatus] = mapped_column(
+    status: Mapped[int] = mapped_column(
         Integer, default=UserStatus.ACTIVE.value, nullable=False
     )
+    status_comment_id: Mapped[int | None] = mapped_column(
+        ForeignKey("comments.comment_id", ondelete="SET NULL"), nullable=True
+    )
+    status_comment: Mapped["Comment | None"] = relationship("Comment")
 
     # Per-user secret key. It is regenerated whenever the password changes.
     # Token verification uses it when present; otherwise it falls back to the
@@ -141,13 +148,13 @@ class User(Base):
         "UserPermission", back_populates="user", cascade="all, delete-orphan"
     )
 
-    block_entries: Mapped[list[UserBlockEntry]] = relationship(
+    block_entries: Mapped[list["UserBlockEntry"]] = relationship(
         "UserBlockEntry", back_populates="user", cascade="all, delete-orphan"
     )
-    audit_entries: Mapped[list[AuditEntry]] = relationship(
+    audit_entries: Mapped[list["AuditEntry"]] = relationship(
         "AuditEntry", back_populates="user"
     )
-    keyring: Mapped[list[UserKey]] = relationship(
+    keyring: Mapped[list["UserKey"]] = relationship(
         "UserKey",
         back_populates="user",
         foreign_keys="UserKey.username",
@@ -165,7 +172,7 @@ class User(Base):
         nullable=True,
         unique=True,
     )
-    preference_dek: Mapped[UserKey | None] = relationship(
+    preference_dek: Mapped["UserKey | None"] = relationship(
         "UserKey",
         uselist=False,
         post_update=True,
@@ -203,32 +210,22 @@ class User(Base):
             f"created_time={self.created_time!r})"
         )
 
+    @property
+    def status_reason(self) -> str | None:
+        return self.status_comment.comment_text if self.status_comment else None
+
     def verify_password(self, plain_password: str) -> bool:
         try:
             return _password_hasher.verify(self.pass_hash, plain_password)
-        except (VerifyMismatchError, VerificationError, InvalidHashError):
+        except VerifyMismatchError, VerificationError, InvalidHashError:
             return False
 
-    def authenticate(self, plain_password: str, totp_token: str | None = None) -> bool:
-        if not self.verify_password(plain_password):
-            return False
+    def create_token_after_authentication(self, plain_password: str) -> Token:
+        """Issue a token after the caller has verified every required factor.
 
-        if self.totp_enabled:
-            if not totp_token:
-                raise UserTOTPRequiredError
-            elif not self.verify_totp(totp_token):
-                raise UserTOTPFailedError
-
-        if self.status != UserStatus.ACTIVE:
-            raise UserNotActiveError
-
-        return True
-
-    def authenticate_and_create_token(
-        self, plain_password: str, totp_token: str | None = None
-    ) -> Token | None:
-        if not self.authenticate(plain_password, totp_token=totp_token):
-            return None  # exceptions should be handled by caller
+        This method will automatically update and commit to the database when
+        generating the token, which may lead to unexpected consequences.
+        """
 
         secret = (
             global_config["server"]["secret_key"]
@@ -269,7 +266,7 @@ class User(Base):
                 algorithms=["HS256"],
             )
             return payload.get("username") == self.username
-        except (jwt.ExpiredSignatureError, jwt.InvalidTokenError):
+        except jwt.ExpiredSignatureError, jwt.InvalidTokenError:
             return False
 
     def renew_token(self) -> Token:
@@ -285,20 +282,16 @@ class User(Base):
 
         return new_token
 
-    def set_password(self, plain_password: str, force_update_after_login: bool = False):
-        """Update the user's password and persist an Argon2id hash."""
+    def set_password(
+        self, plain_password: str, force_update_after_login: bool = False
+    ) -> None:
+        """Update password state; the caller owns persistence."""
         self.pass_hash = _password_hasher.hash(plain_password)
 
         self.secret_key = secrets.token_hex(
             32
         )  # token_hex(32) generates a 64-character hex
         self.passwd_last_modified = time.time() if not force_update_after_login else 0
-
-        # Write to the database.
-        session = object_session(self)
-        if session is not None:
-            session.add(self)
-            session.commit()
 
     def setup_totp(self) -> tuple[str, list[str]]:
         """
@@ -391,7 +384,7 @@ class User(Base):
                             return True
                     except VerifyMismatchError:
                         continue
-            except (orjson.JSONDecodeError, ValueError):
+            except orjson.JSONDecodeError, ValueError:
                 pass
 
         return False
@@ -440,7 +433,7 @@ class User(Base):
         return _effective_permissions(self.rights)
 
     @own_permissions.setter
-    def own_permissions(self, new_permission_list: list[str]):
+    def own_permissions(self, new_permission_entries: list[dict[str, Any]]):
         session = object_session(self)
         if not session:
             raise RuntimeError()
@@ -448,13 +441,14 @@ class User(Base):
         _replace_permission_entries(
             session,
             self.rights,
-            new_permission_list,
-            lambda permission, now: UserPermission(
+            new_permission_entries,
+            lambda entry: UserPermission(
                 user=self,
                 username=self.username,
-                permission=permission,
-                start_time=now,
-                end_time=None,
+                permission=entry["permission"],
+                granted=entry["granted"],
+                start_time=entry["start_time"],
+                end_time=entry["end_time"],
             ),
         )
 
@@ -528,6 +522,7 @@ class User(Base):
 # User permission table with grants, revocations, and validity windows.
 class UserPermission(Base):
     __tablename__ = "user_permissions"
+    __table_args__ = (Index("ix_user_permissions_end_time_id", "end_time", "id"),)
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     username: Mapped[str] = mapped_column(
         ForeignKey("users.username", ondelete="CASCADE")
@@ -537,10 +532,10 @@ class UserPermission(Base):
         Boolean, default=True
     )  # True grants the permission; False revokes it.
     start_time: Mapped[float | None] = mapped_column(
-        Float, nullable=False
+        Double, nullable=False
     )  # Permission start timestamp.
     end_time: Mapped[float | None] = mapped_column(
-        Float, nullable=True
+        Double, nullable=True
     )  # Permission end timestamp.
     user: Mapped[User] = relationship("User", back_populates="rights")
 
@@ -550,22 +545,6 @@ class UserPermission(Base):
             f"permission={self.permission!r}, granted={self.granted!r}, "
             f"start_time={self.start_time!r}, end_time={self.end_time!r})"
         )
-
-
-@event.listens_for(User, "load")
-def filter_permissions_on_load(target, context):
-    now = time.time()
-    # Keep only granted permissions that have not expired.
-    valid_permissions = []
-    session = object_session(target)
-    for perm in list(target.rights):
-        if not perm.granted or (perm.end_time is not None and perm.end_time < now):
-            # Permanently delete expired or revoked permissions from the DB.
-            if session is not None:
-                session.delete(perm)
-        else:
-            valid_permissions.append(perm)
-    target.rights = valid_permissions
 
 
 # User group memberships with validity windows.
@@ -578,9 +557,9 @@ class UserMembership(Base):
     group_name: Mapped[str] = mapped_column(
         ForeignKey("user_groups.group_name", ondelete="CASCADE")
     )
-    start_time: Mapped[float] = mapped_column(Float, nullable=False)  # Join timestamp.
+    start_time: Mapped[float] = mapped_column(Double, nullable=False)  # Join timestamp.
     end_time: Mapped[float | None] = mapped_column(
-        Float, nullable=True
+        Double, nullable=True
     )  # Leave timestamp.
     user: Mapped[User] = relationship("User", back_populates="groups")
     group: Mapped[UserGroup] = relationship("UserGroup", back_populates="memberships")
@@ -618,7 +597,7 @@ class UserGroup(Base):
         return _effective_permissions(self.permissions)
 
     @all_permissions.setter
-    def all_permissions(self, new_permission_list: list[str]):
+    def all_permissions(self, new_permission_entries: list[dict[str, Any]]):
         session = object_session(self)
         if not session:
             raise RuntimeError()
@@ -626,13 +605,14 @@ class UserGroup(Base):
         _replace_permission_entries(
             session,
             self.permissions,
-            new_permission_list,
-            lambda permission, now: UserGroupPermission(
+            new_permission_entries,
+            lambda entry: UserGroupPermission(
                 group=self,
                 group_name=self.group_name,
-                permission=permission,
-                start_time=now,
-                end_time=None,
+                permission=entry["permission"],
+                granted=entry["granted"],
+                start_time=entry["start_time"],
+                end_time=entry["end_time"],
             ),
         )
 
@@ -664,6 +644,7 @@ class UserGroup(Base):
 # Group permission table with grants, revocations, and validity windows.
 class UserGroupPermission(Base):
     __tablename__ = "group_permissions"
+    __table_args__ = (Index("ix_group_permissions_end_time_id", "end_time", "id"),)
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     group_name: Mapped[str] = mapped_column(
         ForeignKey("user_groups.group_name", ondelete="CASCADE")
@@ -673,10 +654,10 @@ class UserGroupPermission(Base):
         Boolean, default=True
     )  # True grants the permission; False revokes it.
     start_time: Mapped[float | None] = mapped_column(
-        Float, nullable=False, default=0.0
+        Double, nullable=False, default=0.0
     )  # Permission start timestamp.
     end_time: Mapped[float | None] = mapped_column(
-        Float, nullable=True
+        Double, nullable=True
     )  # Permission end timestamp.
     group: Mapped[UserGroup] = relationship("UserGroup", back_populates="permissions")
 

@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 from typing import Any
 
 import jsonschema
@@ -12,6 +10,7 @@ from include.database.models.identity import User
 from include.domains.access.authorization.compiled_rules import (
     compile_access_rule,
 )
+from include.domains.access.authorization.evaluation import check_access_requirements
 
 __all__ = [
     "apply_access_rules",
@@ -205,7 +204,7 @@ def apply_access_rules(
         session.flush()
 
     for access_type in new_access_rules:
-        if not target.check_access_requirements(user, access_type):
+        if not check_access_requirements(session, user, target, access_type):
             return False
 
     return True

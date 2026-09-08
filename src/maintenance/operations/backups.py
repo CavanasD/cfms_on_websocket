@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 import importlib
 import logging
 from collections.abc import Iterable
@@ -8,7 +6,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from maintenance.operations.exceptions import MaintenanceOperationError
-from maintenance.runtime import ensure_src_workdir, initialize_providers
+from maintenance.runtime import enter_server_root, initialize_providers
 
 if TYPE_CHECKING:
     from rich.progress import Progress
@@ -44,10 +42,10 @@ def export_backup(
     *,
     key_output_path: str | Path | None = None,
     components: Iterable[str] | None = None,
-    progress: Progress | None = None,
+    progress: "Progress | None" = None,
     show_progress_details: bool = False,
 ) -> BackupExportResult:
-    ensure_src_workdir()
+    enter_server_root()
     backup_module = _load_backup_module()
     warnings: list[str] = []
     selection = (
@@ -78,8 +76,8 @@ def export_backup(
     )
 
 
-def read_backup_info(backup_path: str | Path) -> BackupHeader:
-    ensure_src_workdir()
+def read_backup_info(backup_path: str | Path) -> "BackupHeader":
+    enter_server_root()
     backup_module = _load_backup_module()
 
     try:
@@ -94,10 +92,10 @@ def import_backup(
     *,
     key: str | None = None,
     key_file: str | Path | None = None,
-    progress: Progress | None = None,
+    progress: "Progress | None" = None,
     show_progress_details: bool = False,
 ) -> BackupImportResult:
-    ensure_src_workdir()
+    enter_server_root()
     if (key is None) == (key_file is None):
         raise MaintenanceOperationError("Specify exactly one key source.")
     backup_module = _load_backup_module()

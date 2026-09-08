@@ -8,6 +8,7 @@ from include.database.models.access import (
     UserBlockEntry,
     UserBlockSubEntry,
 )
+from include.database.models.comments import Comment
 from include.database.models.documents import (
     Document,
     DocumentMetadata,
@@ -18,7 +19,14 @@ from include.database.models.documents import (
     Folder,
     Node,
 )
-from include.database.models.files import File, FileTask, TransferMode
+from include.database.models.files import (
+    File,
+    FileDeduplicationPhase,
+    FileDeduplicationTask,
+    FileTask,
+    FileTaskStatus,
+    TransferMode,
+)
 from include.database.models.identity import (
     User,
     UserGroup,
@@ -28,8 +36,19 @@ from include.database.models.identity import (
     UserStatus,
 )
 from include.database.models.keyrings import UserKey
-from include.database.models.operations import AuditEntry
+from include.database.models.operations import (
+    AuditEntry,
+    RateLimitBucket,
+    RiskIPAccount,
+    SystemStateEntry,
+)
+from include.database.models.scheduling import (
+    Schedule,
+    ScheduleExecution,
+    SchedulingRuntimeState,
+)
 from include.database.models.security import (
+    AccountThrottle,
     BannedSubnet,
     LoginThrottle,
     TrafficThrottle,
@@ -37,8 +56,10 @@ from include.database.models.security import (
 from include.database.models.shares import ShareLink
 
 __all__ = [
+    "AccountThrottle",
     "AuditEntry",
     "BannedSubnet",
+    "Comment",
     "CompiledAccessRule",
     "CompiledAccessRuleGroup",
     "CompiledAccessRuleMembership",
@@ -51,11 +72,20 @@ __all__ = [
     "DocumentRevisionStatus",
     "EntityStatus",
     "File",
+    "FileDeduplicationPhase",
+    "FileDeduplicationTask",
     "FileTask",
+    "FileTaskStatus",
     "Folder",
     "LoginThrottle",
     "Node",
     "ObjectAccessEntry",
+    "RateLimitBucket",
+    "RiskIPAccount",
+    "Schedule",
+    "ScheduleExecution",
+    "SchedulingRuntimeState",
+    "SystemStateEntry",
     "TrafficThrottle",
     "TransferMode",
     "ShareLink",

@@ -1,10 +1,64 @@
-__all__ = ["LocalStorageProvider", "LocalFileObject"]
+__all__ = ["LocalFileObject", "LocalStorageProvider"]
 
 import os
+from collections.abc import Buffer, Callable
+from contextlib import ExitStack
 from types import TracebackType
 from typing import IO, Any
 
-from include.providers.base import FileObject, StorageProvider
+from include.providers.base import FileObject, ResumableUpload, StorageProvider
+
+
+class LocalResumableUpload(ResumableUpload):
+    def __init__(self, path: str, file_size: int, chunk_size: int) -> None:
+        self._path = path
+        with ExitStack() as resources:
+            self._file = resources.enter_context(
+                open(path, "r+b" if os.path.exists(path) else "w+b")
+            )
+            existing_size = os.path.getsize(path)
+            if existing_size > file_size:
+                raise ValueError(
+                    "Stored upload progress exceeds the declared file size"
+                )
+            self.offset = (
+                file_size
+                if existing_size == file_size
+                else existing_size - existing_size % chunk_size
+            )
+            self._file.truncate(self.offset)
+            self._file.seek(self.offset)
+            self.session_id = None
+            self.checkpoint_size = chunk_size
+            self.checkpoint_data = None
+            self._closed = False
+            self._resources = resources.pop_all()
+
+    def write(self, data: Buffer) -> int:
+        written = self._file.write(data)
+        self._file.flush()
+        self.offset += written
+        return written
+
+    def finish(self) -> None:
+        self.close()
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        try:
+            self._file.flush()
+        finally:
+            self._resources.close()
+            self._closed = True
+
+    def abort(self) -> None:
+        self.close()
+        try:
+            os.remove(self._path)
+        except FileNotFoundError:
+            pass
+        self.offset = 0
 
 
 class LocalFileObject(FileObject):
@@ -14,7 +68,7 @@ class LocalFileObject(FileObject):
     def read(self, size: int = -1) -> bytes:
         return self._file.read(size)
 
-    def write(self, data: bytes) -> int:
+    def write(self, data: Buffer) -> int:
         return self._file.write(data)
 
     def close(self) -> None:
@@ -42,6 +96,8 @@ class LocalFileObject(FileObject):
 
 
 class LocalStorageProvider(StorageProvider):
+    supports_resumable_uploads = True
+
     def fopen(self, path: str, mode: str = "rb") -> LocalFileObject:
         return LocalFileObject(open(path, mode))
 
@@ -62,3 +118,19 @@ class LocalStorageProvider(StorageProvider):
 
     def getsize(self, filename: str, /) -> int:
         return os.path.getsize(filename)
+
+    def open_resumable_upload(
+        self,
+        path: str,
+        *,
+        file_size: int,
+        chunk_size: int,
+        session_id: str | None = None,
+        checkpoint_size: int | None = None,
+        checkpoint_data: str | None = None,
+        checkpoint_callback: Callable[[str], None] | None = None,
+    ) -> LocalResumableUpload:
+        return LocalResumableUpload(path, file_size, chunk_size)
+
+    def abort_resumable_upload(self, path: str, session_id: str) -> None:
+        return None

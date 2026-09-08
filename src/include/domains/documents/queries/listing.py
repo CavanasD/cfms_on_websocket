@@ -1,7 +1,4 @@
-from __future__ import annotations
-
 from collections.abc import Sequence
-from functools import cmp_to_key
 from itertools import batched
 from typing import Any
 
@@ -438,8 +435,8 @@ def _effective_active_revision_details_subquery(document_filters: Sequence[Any])
     matched_documents = (
         select(
             document_table.c.id,
-            document_table.c.title,
-            document_table.c.folder_id,
+            node_table.c.name,
+            node_table.c.parent_id,
             document_table.c.created_time,
             document_table.c.current_revision_id,
             node_table.c.inherit,
@@ -557,9 +554,9 @@ def _effective_active_revision_details_subquery(document_filters: Sequence[Any])
     return (
         select(
             matched_documents.c.id.label("id"),
-            matched_documents.c.title.label("name"),
-            func.lower(matched_documents.c.title).label("name_sort_key"),
-            matched_documents.c.folder_id.label("parent_id"),
+            matched_documents.c.name.label("name"),
+            func.lower(matched_documents.c.name).label("name_sort_key"),
+            matched_documents.c.parent_id.label("parent_id"),
             matched_documents.c.created_time.label("created_time"),
             matched_documents.c.inherit.label("inherit"),
             effective_ranked.c.revision_created_time.label("last_modified"),
@@ -808,7 +805,6 @@ def _search_candidate_selectable(
     search_documents: bool,
     search_directories: bool,
 ):
-    like_pattern = f"%{query}%"
     selects = []
 
     if search_directories:
@@ -827,7 +823,7 @@ def _search_candidate_selectable(
                 Folder.inherit.label("inherit"),
             ).where(
                 Folder.status != EntityStatus.DELETED,
-                Folder.name.ilike(like_pattern),
+                Folder.name.icontains(query, autoescape=True),
             )
         )
 
@@ -835,7 +831,7 @@ def _search_candidate_selectable(
         document_details = _effective_active_revision_details_subquery(
             [
                 Node.__table__.c.status != EntityStatus.DELETED,
-                Document.__table__.c.title.ilike(like_pattern),
+                Node.__table__.c.name.icontains(query, autoescape=True),
             ]
         )
         selects.append(
@@ -868,7 +864,7 @@ def _search_ancestor_cte(candidates):
             candidates.c.type.label("object_type"),
             candidates.c.id.label("object_id"),
             folder_table.c.id.label("node_id"),
-            folder_table.c.parent_id.label("parent_id"),
+            node_table.c.parent_id.label("parent_id"),
             node_table.c.inherit.label("inherit"),
         )
         .select_from(
@@ -886,7 +882,7 @@ def _search_ancestor_cte(candidates):
             ancestors.c.object_type,
             ancestors.c.object_id,
             parent_folder.c.id,
-            parent_folder.c.parent_id,
+            parent_node.c.parent_id,
             parent_node.c.inherit,
         )
         .select_from(
@@ -984,96 +980,3 @@ def fetch_visible_search_candidate_rows(
             item.pop("size", None)
         rows.append(item)
     return rows
-
-
-def fetch_search_candidate_rows(
-    session,
-    *,
-    query: str,
-    sort_by: str,
-    sort_order: str,
-    search_documents: bool,
-    search_directories: bool,
-    last_key: list[Any] | None,
-    limit: int,
-) -> list[dict[str, Any]]:
-    candidate_rows: list[dict[str, Any]] = []
-    like_pattern = f"%{query}%"
-
-    if search_directories:
-        folder_selectable = (
-            select(
-                Folder.id.label("id"),
-                Folder.name.label("name"),
-                func.lower(Folder.name).label("name_sort_key"),
-                Folder.parent_id.label("parent_id"),
-                Folder.created_time.label("created_time"),
-                literal(None).label("last_modified"),
-                literal(0).label("size"),
-                literal("directory").label("type"),
-                literal(0).label("type_rank"),
-            )
-            .where(
-                Folder.status != EntityStatus.DELETED,
-                Folder.name.ilike(like_pattern),
-            )
-            .subquery()
-        )
-        primary_column = _search_primary_column(folder_selectable, sort_by)
-        folder_query = select(folder_selectable)
-        cursor_filter = _apply_search_cursor_filter(
-            folder_selectable, primary_column, last_key, sort_order
-        )
-        if cursor_filter is not None:
-            folder_query = folder_query.where(cursor_filter)
-        folder_query = folder_query.order_by(
-            *_search_ordering(folder_selectable, primary_column, sort_order)
-        ).limit(limit)
-        for row in session.execute(folder_query).mappings():
-            item = dict(row)
-            item[_CURSOR_KEY] = _search_item_cursor_key(item, sort_by)
-            item.pop("name_sort_key", None)
-            candidate_rows.append(item)
-
-    if search_documents:
-        document_details = _effective_active_revision_details_subquery(
-            [
-                Node.__table__.c.status != EntityStatus.DELETED,
-                Document.__table__.c.title.ilike(like_pattern),
-            ]
-        )
-        primary_column = _search_primary_column(document_details, sort_by)
-        document_query = select(document_details)
-        cursor_filter = _apply_search_cursor_filter(
-            document_details, primary_column, last_key, sort_order
-        )
-        if cursor_filter is not None:
-            document_query = document_query.where(cursor_filter)
-        document_query = document_query.order_by(
-            *_search_ordering(document_details, primary_column, sort_order)
-        ).limit(limit)
-        for row in session.execute(document_query).mappings():
-            item = dict(row)
-            item[_CURSOR_KEY] = _search_item_cursor_key(item, sort_by)
-            item.pop("name_sort_key", None)
-            item.pop("inherit", None)
-            candidate_rows.append(item)
-
-    def compare_rows(left: dict[str, Any], right: dict[str, Any]) -> int:
-        left_key = search_cursor_key(left, sort_by)
-        right_key = search_cursor_key(right, sort_by)
-        if left_key[0] != right_key[0]:
-            if sort_order == "desc":
-                return -1 if left_key[0] > right_key[0] else 1
-            return -1 if left_key[0] < right_key[0] else 1
-        if left_key[1] != right_key[1]:
-            return -1 if left_key[1] < right_key[1] else 1
-        if left_key[2] != right_key[2]:
-            return -1 if left_key[2] < right_key[2] else 1
-        return 0
-
-    candidate_rows.sort(key=cmp_to_key(compare_rows))
-    return candidate_rows[:limit]
-
-
-_fetch_latest_active_revisions_by_document = fetch_latest_active_revisions_by_document

@@ -8,22 +8,47 @@ with permission filtering, result limiting, and sorting capabilities.
 __all__ = ["RequestSearchHandler"]
 
 import time
+from typing import Annotated, Literal
+
+from pydantic import StringConstraints
 
 from include.database.models.identity import User
 from include.database.session import Session
+from include.domains.access.permissions import Permissions
 from include.domains.documents.queries.listing import (
     fetch_visible_search_candidate_rows,
     search_cursor_key,
 )
 from include.domains.pagination import (
-    CURSOR_PAGINATION_SCHEMA,
     CursorError,
     PaginationCursor,
+    PaginationCursorToken,
+    PaginationPageSize,
     get_page_size,
     make_cursor_response,
 )
 from include.transport.connection import ConnectionHandler
-from include.transport.request_handler import RequestHandler, Result
+from include.transport.request_handler import (
+    REQUEST_UNSET,
+    Omittable,
+    RequestDataModel,
+    RequestHandler,
+    Result,
+)
+
+_SearchQuery = Annotated[str, StringConstraints(min_length=1, max_length=255)]
+
+
+class _SearchRequest(RequestDataModel):
+    query: _SearchQuery
+    page_size: Omittable[PaginationPageSize] = REQUEST_UNSET
+    cursor: PaginationCursorToken | None = None
+    sort_by: Omittable[Literal["name", "created_time", "size", "last_modified"]] = (
+        REQUEST_UNSET
+    )
+    sort_order: Omittable[Literal["asc", "desc"]] = REQUEST_UNSET
+    search_documents: Omittable[bool] = REQUEST_UNSET
+    search_directories: Omittable[bool] = REQUEST_UNSET
 
 
 class RequestSearchHandler(RequestHandler):
@@ -38,24 +63,10 @@ class RequestSearchHandler(RequestHandler):
     5. Supports sorting by multiple criteria (time, size, name, etc.)
     """
 
-    schema = {
-        "type": "object",
-        "properties": {
-            "query": {"type": "string", "minLength": 1},
-            **CURSOR_PAGINATION_SCHEMA,
-            "sort_by": {
-                "type": "string",
-                "enum": ["name", "created_time", "size", "last_modified"],
-            },
-            "sort_order": {"type": "string", "enum": ["asc", "desc"]},
-            "search_documents": {"type": "boolean"},
-            "search_directories": {"type": "boolean"},
-        },
-        "required": ["query"],
-        "additionalProperties": False,
-    }
+    request_model = _SearchRequest
 
     require_auth = True
+    rate_limit_cost = 3
 
     def handle(self, handler: ConnectionHandler):
         """
@@ -103,6 +114,12 @@ class RequestSearchHandler(RequestHandler):
 
         with Session() as session:
             user = User.get_existing(session, handler.username)
+
+            if Permissions.SEARCH not in user.all_permissions:
+                handler.conclude_request(
+                    403, {}, "User does not have permission to perform search"
+                )
+                return Result(code=403, target=query, username=handler.username)
 
             now = time.time()
             all_results = fetch_visible_search_candidate_rows(

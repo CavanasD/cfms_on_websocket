@@ -6,8 +6,6 @@ experimental purposes. We make no guarantees regarding the functional reliabilit
 of this extension.
 """
 
-from __future__ import annotations
-
 import base64
 import hashlib
 import secrets
@@ -32,7 +30,14 @@ from include.exceptions.misc import UserNotActiveError
 from include.extensions.manager import hookimpl
 from include.providers.manager import ProviderManager
 from include.transport.connection import ConnectionHandler
-from include.transport.request_handler import RequestHandler, Result
+from include.transport.request_handler import (
+    REQUEST_UNSET,
+    Omittable,
+    RequestDataModel,
+    RequestHandler,
+    Result,
+)
+from include.types import NonEmptyString
 
 logger = log.bind(name="oidc_sso")
 
@@ -66,7 +71,6 @@ def _get_oidc_config() -> dict[str, Any]:
     redirect_uri = str(oidc_cfg.get("redirect_uri", ""))
 
     return {
-        "enabled": bool(oidc_cfg.get("enabled", False)),
         "issuer": issuer,
         "client_id": client_id,
         "client_secret": str(oidc_cfg.get("client_secret", "")),
@@ -81,11 +85,8 @@ def _get_oidc_config() -> dict[str, Any]:
     }
 
 
-def _require_enabled_config() -> dict[str, Any]:
+def _get_validated_oidc_config() -> dict[str, Any]:
     cfg = _get_oidc_config()
-    if not cfg["enabled"]:
-        raise OIDCConfigurationError("OIDC SSO is disabled")
-
     missing = [
         name for name in ("issuer", "client_id", "redirect_uri") if not cfg.get(name)
     ]
@@ -285,9 +286,12 @@ def _validate_id_token(
         raise OIDCAuthenticationError("OIDC nonce validation failed")
 
     audience = claims.get("aud")
-    if isinstance(audience, list) and len(audience) > 1:
-        if claims.get("azp") != cfg["client_id"]:
-            raise OIDCAuthenticationError("OIDC authorized party validation failed")
+    if (
+        isinstance(audience, list)
+        and len(audience) > 1
+        and claims.get("azp") != cfg["client_id"]
+    ):
+        raise OIDCAuthenticationError("OIDC authorized party validation failed")
 
     return claims
 
@@ -338,19 +342,23 @@ def _resolve_or_create_user(cfg: dict[str, Any], claims: dict[str, Any]) -> User
         return session.get(User, username)
 
 
+class _OIDCStartRequest(RequestDataModel):
+    redirect_uri: Omittable[NonEmptyString] = REQUEST_UNSET
+
+
 class RequestOIDCStartHandler(RequestHandler):
-    schema = {
-        "type": "object",
-        "properties": {
-            "redirect_uri": {"type": "string", "minLength": 1},
-        },
-        "additionalProperties": False,
-    }
+    request_model = _OIDCStartRequest
+    rate_limit_cost = 3
 
     def handle(self, handler: ConnectionHandler) -> Result | None:
         try:
-            cfg = _require_enabled_config()
-            redirect_uri = handler.data.get("redirect_uri") or cfg["redirect_uri"]
+            cfg = _get_validated_oidc_config()
+            requested_redirect_uri = handler.data.get("redirect_uri")
+            if requested_redirect_uri and requested_redirect_uri != cfg["redirect_uri"]:
+                raise OIDCConfigurationError(
+                    "OIDC redirect_uri must match the configured redirect URI"
+                )
+            redirect_uri = cfg["redirect_uri"]
             metadata = _get_provider_metadata(cfg)
             authorization_url, state_data = _create_authorization_url(
                 cfg, metadata, redirect_uri
@@ -375,19 +383,17 @@ class RequestOIDCStartHandler(RequestHandler):
         return Result(code=200)
 
 
+class _OIDCCallbackRequest(RequestDataModel):
+    state: NonEmptyString
+    code: Omittable[NonEmptyString] = REQUEST_UNSET
+    redirect_uri: Omittable[NonEmptyString] = REQUEST_UNSET
+    error: Omittable[NonEmptyString] = REQUEST_UNSET
+    error_description: Omittable[str] = REQUEST_UNSET
+
+
 class RequestOIDCCallbackHandler(RequestHandler):
-    schema = {
-        "type": "object",
-        "properties": {
-            "state": {"type": "string", "minLength": 1},
-            "code": {"type": "string", "minLength": 1},
-            "redirect_uri": {"type": "string", "minLength": 1},
-            "error": {"type": "string", "minLength": 1},
-            "error_description": {"type": "string"},
-        },
-        "required": ["state"],
-        "additionalProperties": False,
-    }
+    request_model = _OIDCCallbackRequest
+    rate_limit_cost = 10
 
     def handle(self, handler: ConnectionHandler) -> Result | None:
         state = handler.data["state"]
@@ -403,7 +409,7 @@ class RequestOIDCCallbackHandler(RequestHandler):
             return Result(code=400)
 
         try:
-            cfg = _require_enabled_config()
+            cfg = _get_validated_oidc_config()
             state_data = _pop_state(state)
             if state_data is None:
                 handler.conclude_request(401, {}, "Invalid or expired OIDC state")
@@ -431,8 +437,10 @@ class RequestOIDCCallbackHandler(RequestHandler):
 
                 user.last_login = time.time()
                 session.commit()
-        except UserNotActiveError:
-            handler.conclude_request(4003, {}, "User account is not active")
+        except UserNotActiveError as exc:
+            handler.conclude_request(
+                4003, {"reason": exc.reason}, "User account is not active"
+            )
             return Result(code=4003)
         except (OIDCConfigurationError, OIDCAuthenticationError, jwt.PyJWTError) as exc:
             handler.conclude_request(401, {}, str(exc))
@@ -461,7 +469,4 @@ def ext_register_whitelisted_actions() -> set[str]:
 
 @hookimpl
 def ext_register_extension_flags() -> set[str]:
-    if not _get_oidc_config()["enabled"]:
-        return set()
-
     return {"oidc_sso"}

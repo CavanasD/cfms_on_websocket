@@ -6,14 +6,72 @@ two-factor authentication using Time-based One-Time Passwords (TOTP).
 """
 
 from operator import xor
+from typing import Literal, Self
 
 import orjson
+from pydantic import model_validator
 
 from include.database.models.identity import User, UserStatus
 from include.database.session import Session
 from include.domains.access.permissions import Permissions
+from include.domains.identity.types import RequestUsername
+from include.domains.security.guards.login import (
+    AuthFactor,
+    LoginGuard,
+    ThrottleDecision,
+)
+from include.domains.security.types import TwoFactorToken
+from include.transport.client_address import get_client_ip
 from include.transport.connection import ConnectionHandler
-from include.transport.request_handler import RequestHandler, Result
+from include.transport.request_handler import (
+    REQUEST_UNSET,
+    EmptyRequestDataModel,
+    Omittable,
+    RequestDataModel,
+    RequestHandler,
+    Result,
+)
+from include.types import NonEmptyString
+
+
+class _Setup2FARequest(RequestDataModel):
+    method: Omittable[Literal["totp"]] = REQUEST_UNSET
+
+
+class _Validate2FARequest(RequestDataModel):
+    token: TwoFactorToken
+
+
+class _Disable2FARequest(RequestDataModel):
+    username: Omittable[RequestUsername] = REQUEST_UNSET
+    password: Omittable[NonEmptyString] = REQUEST_UNSET
+
+    @model_validator(mode="after")
+    def require_username_or_password(self) -> Self:
+        if not {"username", "password"} & self.model_fields_set:
+            raise ValueError("username or password is required")
+        return self
+
+
+class _Get2FAStatusRequest(RequestDataModel):
+    target: Omittable[NonEmptyString] = REQUEST_UNSET
+
+
+def _conclude_throttled(
+    handler: ConnectionHandler,
+    decision: ThrottleDecision,
+    target: str,
+    username: str | None = None,
+) -> Result:
+    data = {}
+    if decision.retry_after_seconds is not None:
+        data["retry_after_seconds"] = decision.retry_after_seconds
+    handler.conclude_request(
+        429,
+        data,
+        "Too many authentication attempts. Please try again later.",
+    )
+    return Result(code=429, target=target, username=username)
 
 
 class RequestSetup2FAHandler(RequestHandler):
@@ -30,13 +88,10 @@ class RequestSetup2FAHandler(RequestHandler):
         - backup_codes: List of backup codes for account recovery
     """
 
-    schema = {
-        "type": "object",
-        "properties": {"method": {"type": "string", "enum": ["totp"]}},
-        "additionalProperties": False,
-    }
+    request_model = _Setup2FARequest
 
     require_auth = True
+    rate_limit_cost = 20
 
     def handle(self, handler: ConnectionHandler):
         with Session() as session:
@@ -76,16 +131,10 @@ class RequestValidate2FAHandler(RequestHandler):
     providing a valid code from their authenticator app. This enables 2FA.
     """
 
-    schema = {
-        "type": "object",
-        "properties": {
-            "token": {"type": "string", "minLength": 1},
-        },
-        "required": ["token"],
-        "additionalProperties": False,
-    }
+    request_model = _Validate2FARequest
 
     require_auth = True
+    rate_limit_cost = 2
 
     def handle(self, handler: ConnectionHandler):
         token = handler.data["token"]
@@ -146,20 +195,10 @@ class RequestDisable2FAHandler(RequestHandler):
     The user must provide their password for verification.
     """
 
-    schema = {
-        "type": "object",
-        "properties": {
-            "username": {"type": "string", "minLength": 1},
-            "password": {"type": "string", "minLength": 1},
-        },
-        "anyOf": [
-            {"required": ["username"]},
-            {"required": ["password"]},
-        ],
-        "additionalProperties": False,
-    }
+    request_model = _Disable2FARequest
 
     require_auth = True
+    rate_limit_cost = 5
 
     def handle(self, handler: ConnectionHandler):
         password = handler.data.get("password")
@@ -178,7 +217,25 @@ class RequestDisable2FAHandler(RequestHandler):
             handler.conclude_request(400, {}, error_msg)
             return Result(code=400, target=target_username, username=requester_username)
 
+        ip = get_client_ip(handler.stream.connection._ws)
+        if password:
+            decision = LoginGuard.evaluate(ip, target_username, AuthFactor.PASSWORD)
+            if not decision.allowed:
+                return _conclude_throttled(
+                    handler, decision, target_username, requester_username
+                )
+
         with Session() as session:
+            if not is_self:
+                requester = User.get_existing(session, requester_username)
+                if Permissions.MANAGE_2FA not in requester.all_permissions:
+                    handler.conclude_request(403, {}, "Permission denied")
+                    return Result(
+                        code=403,
+                        target=target_username,
+                        username=requester_username,
+                    )
+
             user = session.get(User, target_username)
             if not user or not user.totp_enabled:
                 handler.conclude_request(400, {}, "2FA not enabled or user not found")
@@ -188,22 +245,23 @@ class RequestDisable2FAHandler(RequestHandler):
 
             if password:
                 if not user.verify_password(password):
+                    LoginGuard.report_failure(ip, target_username, AuthFactor.PASSWORD)
                     handler.conclude_request(401, {}, "Invalid password")
                     return Result(
                         code=401, target=target_username, username=requester_username
                     )
 
+                LoginGuard.report_success(
+                    ip,
+                    target_username,
+                    AuthFactor.PASSWORD,
+                    completed_authentication=True,
+                )
+
                 if user.status != UserStatus.ACTIVE:
                     handler.conclude_request(4003, {}, "User account is not active")
                     return Result(
                         code=4003, target=target_username, username=requester_username
-                    )
-            else:
-                requester = User.get_existing(session, requester_username)
-                if Permissions.MANAGE_2FA not in requester.all_permissions:
-                    handler.conclude_request(403, {}, "Permission denied")
-                    return Result(
-                        code=403, target=target_username, username=requester_username
                     )
 
             user.disable_totp()
@@ -220,13 +278,10 @@ class RequestCancel2FASetupHandler(RequestHandler):
     but not yet validated/enabled.
     """
 
-    schema = {
-        "type": "object",
-        "properties": {},
-        "additionalProperties": False,
-    }
+    request_model = EmptyRequestDataModel
 
     require_auth = True
+    rate_limit_cost = 1
 
     def handle(self, handler: ConnectionHandler):
         with Session() as session:
@@ -262,15 +317,10 @@ class RequestGet2FAStatusHandler(RequestHandler):
     Returns whether 2FA is enabled for the authenticated user.
     """
 
-    schema = {
-        "type": "object",
-        "properties": {
-            "target": {"type": "string", "minLength": 1},
-        },
-        "additionalProperties": False,
-    }
+    request_model = _Get2FAStatusRequest
 
     require_auth = True
+    rate_limit_cost = 1
 
     def handle(self, handler: ConnectionHandler):
 
@@ -278,15 +328,6 @@ class RequestGet2FAStatusHandler(RequestHandler):
 
         with Session() as session:
             user = User.get_existing(session, handler.username)
-            target = session.get(User, target_username)
-
-            if not target:
-                handler.conclude_request(
-                    code=404,
-                    message="Target user not found",
-                    data={},
-                )
-                return
 
             if (
                 target_username != handler.username
@@ -300,6 +341,15 @@ class RequestGet2FAStatusHandler(RequestHandler):
                 return Result(
                     code=403, target=target_username, username=handler.username
                 )
+
+            target = session.get(User, target_username)
+            if not target:
+                handler.conclude_request(
+                    code=404,
+                    message="Target user not found",
+                    data={},
+                )
+                return
 
             handler.conclude_request(
                 code=200,

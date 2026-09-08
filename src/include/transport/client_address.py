@@ -1,35 +1,79 @@
-__all__ = ["get_client_ip", "is_v6_address"]
+__all__ = [
+    "get_bind_options",
+    "get_client_ip",
+    "resolve_client_ip",
+]
 
 import ipaddress
+import socket
+from collections.abc import Collection
 
+from loguru import logger
 from websockets.sync.server import ServerConnection
 
-from include.config.constants import TRUSTED_PROXY_IPS
+from include.config.settings import global_config
+from include.config.validation import get_trusted_proxy_networks
+
+
+def _parse_ip(value: str) -> ipaddress.IPv4Address | ipaddress.IPv6Address:
+    address = ipaddress.ip_address(value.strip())
+    if isinstance(address, ipaddress.IPv6Address) and address.ipv4_mapped:
+        return address.ipv4_mapped
+    return address
+
+
+def resolve_client_ip(
+    peer_host: str,
+    forwarded_for: str | None,
+    real_ip: str | None,
+    trusted_networks: Collection[ipaddress.IPv4Network | ipaddress.IPv6Network],
+) -> str:
+    peer_address = _parse_ip(peer_host)
+    if not any(peer_address in network for network in trusted_networks):
+        return str(peer_address)
+
+    if forwarded_for:
+        try:
+            forwarded_chain = [_parse_ip(value) for value in forwarded_for.split(",")]
+        except ValueError:
+            logger.warning("Ignoring invalid X-Forwarded-For header")
+            return str(peer_address)
+
+        for address in reversed([*forwarded_chain, peer_address]):
+            if not any(address in network for network in trusted_networks):
+                return str(address)
+        return str(forwarded_chain[0])
+
+    if real_ip:
+        try:
+            return str(_parse_ip(real_ip))
+        except ValueError:
+            logger.warning("Ignoring invalid X-Real-IP header")
+
+    return str(peer_address)
+
+
+def get_bind_options(
+    address: str, dualstack_ipv6: bool
+) -> tuple[socket.AddressFamily, bool]:
+    """Return a compatible socket family and dual-stack setting for a host."""
+    family = socket.AddressFamily(
+        socket.getaddrinfo(
+            address,
+            None,
+            type=socket.SOCK_STREAM,
+            flags=socket.AI_PASSIVE,
+        )[0][0]
+    )
+
+    return family, dualstack_ipv6 and family == socket.AF_INET6
 
 
 def get_client_ip(websocket: ServerConnection) -> str:
     assert websocket.request is not None
-
-    # The actual TCP peer address of the websocket connection.
-    peer_ip = websocket.remote_address[0]
-
-    # Only trust forwarding headers if the TCP peer is a known reverse proxy.
-    if peer_ip in TRUSTED_PROXY_IPS:
-        forwarded_for = websocket.request.headers.get("X-Forwarded-For")
-        if forwarded_for:
-            return forwarded_for.split(",")[0].strip()
-
-        real_ip = websocket.request.headers.get("X-Real-IP")
-        if real_ip:
-            return real_ip.strip()
-
-    # Fallback to the peer IP when no trusted proxy is involved or no headers are present.
-    return peer_ip
-
-
-def is_v6_address(address):
-    try:
-        ip = ipaddress.ip_address(address)
-        return ip.version == 6
-    except ValueError:
-        return False
+    return resolve_client_ip(
+        websocket.remote_address[0],
+        websocket.request.headers.get("X-Forwarded-For"),
+        websocket.request.headers.get("X-Real-IP"),
+        get_trusted_proxy_networks(global_config),
+    )
