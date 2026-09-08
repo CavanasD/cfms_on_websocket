@@ -57,6 +57,7 @@ from include.domains.documents.handlers.revisions import (
 from include.domains.documents.handlers.search import RequestSearchHandler
 from include.domains.identity.handlers.auth import (
     RequestLoginHandler,
+    RequestLogoutHandler,
     RequestRefreshTokenHandler,
 )
 from include.domains.identity.handlers.groups import (
@@ -129,6 +130,7 @@ logger = log.bind(name="connection_handler")
 available_functions: dict[str, type[RequestHandler]] = {
     # Authentication
     "login": RequestLoginHandler,
+    "logout": RequestLogoutHandler,
     "refresh_token": RequestRefreshTokenHandler,
     # Two-factor authentication
     "setup_2fa": RequestSetup2FAHandler,

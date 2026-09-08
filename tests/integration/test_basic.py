@@ -86,6 +86,13 @@ class TestAuthentication:
         assert new_token != old_token
 
     @pytest.mark.asyncio
+    async def test_logout_revokes_the_current_token(
+        self, authenticated_client: CFMSTestClient
+    ):
+        assert_success(await authenticated_client.send_request("logout"))
+        assert_error(await authenticated_client.refresh_token(), 401)
+
+    @pytest.mark.asyncio
     async def test_authentication_required(self, client: CFMSTestClient):
         response = await client.send_request("list_users", include_auth=False)
         assert_error(response, 401)

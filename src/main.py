@@ -281,6 +281,7 @@ def server_init():
                 "start_time": 0,
                 "end_time": None,
             },
+            {"group_name": "user", "start_time": 0, "end_time": None},
         ],
     )
 

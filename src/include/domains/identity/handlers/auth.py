@@ -181,3 +181,25 @@ class RequestRefreshTokenHandler(RequestHandler):
                 )
 
         handler.conclude_request(**response)
+
+
+class RequestLogoutHandler(RequestHandler):
+    """Invalidate the current user's active tokens."""
+
+    request_model = EmptyRequestDataModel
+    require_auth = True
+
+    def handle(self, handler: ConnectionHandler):
+        with Session() as session:
+            user = User.get_existing(session, handler.username)
+            user.invalidate_tokens()
+            session.commit()
+
+        log_audit(
+            "logout",
+            target=handler.username,
+            result=0,
+            remote_address=handler.remote_address,
+        )
+        handler.conclude_request(200, {}, "Logged out")
+        return Result(code=0, target=handler.username, username=handler.username)
