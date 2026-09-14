@@ -374,6 +374,10 @@ def test_bundled_extension_catalog_is_valid():
         "http_api",
         "oidc_sso",
         "scheduling",
+        "drive",
+        "transfer_data_plane",
+        "thesis_attack_lab",
+        "src_portal",
     }
 
 

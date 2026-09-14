@@ -125,7 +125,12 @@ def test_sync_keeps_new_targets_and_warns_for_unconvertible_values(
     synchronized = tomlkit.parse((src_dir / "config.toml").read_text(encoding="utf-8"))
 
     assert synchronized["database"]["name"] == "current_database"
-    assert synchronized["extensions"]["enabled"] == []
+    assert synchronized["extensions"]["enabled"] == [
+        "drive",
+        "transfer_data_plane",
+        "thesis_attack_lab",
+        "src_portal",
+    ]
     assert (
         synchronized["security"]["passwd_rules"] == current["security"]["passwd_rules"]
     )

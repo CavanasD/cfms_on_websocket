@@ -1,10 +1,8 @@
-from __future__ import annotations
-
 import secrets
 import time
 from typing import TYPE_CHECKING
 
-from sqlalchemy import VARCHAR, BigInteger, Float, ForeignKey, Integer, Text
+from sqlalchemy import VARCHAR, BigInteger, Double, ForeignKey, Integer, Text
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from include.database.session import Base
@@ -35,20 +33,20 @@ class SrcReport(Base):
         VARCHAR(16), nullable=False, default="pending", server_default="pending"
     )
     created_at: Mapped[float] = mapped_column(
-        Float, nullable=False, default=lambda: time.time(), index=True
+        Double, nullable=False, default=lambda: time.time(), index=True
     )
     updated_at: Mapped[float] = mapped_column(
-        Float, nullable=False, default=lambda: time.time(), index=True
+        Double, nullable=False, default=lambda: time.time(), index=True
     )
 
-    reporter: Mapped[User] = relationship("User", foreign_keys=[reporter_username])
-    attachments: Mapped[list[SrcReportAttachment]] = relationship(
+    reporter: Mapped["User"] = relationship("User", foreign_keys=[reporter_username])
+    attachments: Mapped[list["SrcReportAttachment"]] = relationship(
         "SrcReportAttachment",
         back_populates="report",
         cascade="all, delete-orphan",
         order_by="SrcReportAttachment.id",
     )
-    events: Mapped[list[SrcReportEvent]] = relationship(
+    events: Mapped[list["SrcReportEvent"]] = relationship(
         "SrcReportEvent",
         back_populates="report",
         cascade="all, delete-orphan",
@@ -78,13 +76,13 @@ class SrcReportAttachment(Base):
         VARCHAR(255), nullable=False, default="application/octet-stream"
     )
     created_at: Mapped[float] = mapped_column(
-        Float, nullable=False, default=lambda: time.time()
+        Double, nullable=False, default=lambda: time.time()
     )
 
-    report: Mapped[SrcReport] = relationship(
+    report: Mapped["SrcReport"] = relationship(
         "SrcReport", back_populates="attachments"
     )
-    document: Mapped[Document | None] = relationship("Document")
+    document: Mapped["Document | None"] = relationship("Document")
 
 
 class SrcReportEvent(Base):
@@ -106,8 +104,8 @@ class SrcReportEvent(Base):
     to_status: Mapped[str] = mapped_column(VARCHAR(16), nullable=False)
     note_md: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[float] = mapped_column(
-        Float, nullable=False, default=lambda: time.time(), index=True
+        Double, nullable=False, default=lambda: time.time(), index=True
     )
 
-    report: Mapped[SrcReport] = relationship("SrcReport", back_populates="events")
-    actor: Mapped[User | None] = relationship("User", foreign_keys=[actor_username])
+    report: Mapped["SrcReport"] = relationship("SrcReport", back_populates="events")
+    actor: Mapped["User | None"] = relationship("User", foreign_keys=[actor_username])

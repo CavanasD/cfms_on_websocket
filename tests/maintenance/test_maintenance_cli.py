@@ -1008,7 +1008,13 @@ license = "Apache-2.0"
     assert "Restart any running server" in _normalize_cli_output(enabled.stdout)
     assert "CLI Extension" in _normalize_cli_output(info.stdout)
     config = tomlkit.parse((src_dir / "config.toml").read_text(encoding="utf-8"))
-    assert config["extensions"]["enabled"] == ["cli_extension"]
+    assert config["extensions"]["enabled"] == [
+        "drive",
+        "transfer_data_plane",
+        "thesis_attack_lab",
+        "src_portal",
+        "cli_extension",
+    ]
 
 
 def test_backup_export_interactive_rejects_other_arguments(tmp_path):

@@ -4,7 +4,7 @@ import secrets
 import time
 from typing import TYPE_CHECKING
 
-from sqlalchemy import VARCHAR, Boolean, Float, ForeignKey, Integer, Text
+from sqlalchemy import VARCHAR, Boolean, Double, ForeignKey, Integer, Text
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from include.database.session import Base
@@ -33,9 +33,9 @@ class ShareLink(Base):
         index=True,
     )
     created_at: Mapped[float] = mapped_column(
-        Float, nullable=False, default=lambda: time.time()
+        Double, nullable=False, default=lambda: time.time()
     )
-    expires_at: Mapped[float | None] = mapped_column(Float, nullable=True)
+    expires_at: Mapped[float | None] = mapped_column(Double, nullable=True)
     max_downloads: Mapped[int | None] = mapped_column(Integer, nullable=True)
     download_count: Mapped[int] = mapped_column(
         Integer, nullable=False, default=0, server_default="0"

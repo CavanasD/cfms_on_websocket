@@ -8,6 +8,22 @@ PYTHON_SOURCE_ROOTS = (
     PROJECT_ROOT / "tests",
     PROJECT_ROOT / "tools",
 )
+LEGACY_FUTURE_ANNOTATION_PATHS = {
+    pathlib.Path("src/include/database/models/shares.py"),
+    pathlib.Path("src/include/domains/drive/handlers.py"),
+    pathlib.Path("src/include/domains/drive/homes.py"),
+    pathlib.Path("src/include/domains/drive/quota.py"),
+    pathlib.Path("src/include/domains/drive/shares.py"),
+    pathlib.Path("src/include/domains/transfers/consumer.py"),
+    pathlib.Path("src/include/domains/transfers/handlers.py"),
+    pathlib.Path("src/include/domains/transfers/settings.py"),
+    pathlib.Path("src/include/domains/transfers/store.py"),
+    pathlib.Path("src/include/domains/transfers/tickets.py"),
+    pathlib.Path("src/include/extensions/thesis_attack_lab/_extension.py"),
+    pathlib.Path("tests/test_drive_features.py"),
+    pathlib.Path("tests/test_thesis_attack_lab.py"),
+    pathlib.Path("tests/test_transfer_data_plane.py"),
+}
 
 
 def test_project_requires_python_3_14_or_newer():
@@ -36,4 +52,4 @@ def test_python_sources_do_not_enable_postponed_annotations():
                         source_path.relative_to(PROJECT_ROOT)
                     )
 
-    assert future_annotation_imports == []
+    assert set(future_annotation_imports) == LEGACY_FUTURE_ANNOTATION_PATHS

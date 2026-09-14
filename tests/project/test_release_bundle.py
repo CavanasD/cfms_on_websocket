@@ -111,9 +111,13 @@ def test_release_archives_contain_only_deployable_files(tmp_path):
     assert manifest["managed_extensions"] == [
         "brute_force_lockdown",
         "builtin",
+        "drive",
         "http_api",
         "oidc_sso",
         "scheduling",
+        "src_portal",
+        "thesis_attack_lab",
+        "transfer_data_plane",
     ]
     assert "release-manifest.json" not in manifest["files"]
     assert not any(
