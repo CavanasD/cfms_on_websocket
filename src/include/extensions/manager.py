@@ -11,6 +11,7 @@ __all__ = [
     "collect_scheduled_tasks",
     "discover_extensions",
     "get_loaded_extension_metadata",
+    "hot_reload_extension",
     "load_extensions_from_directory",
     "parse_extension_manifest",
     "pm",
@@ -18,6 +19,7 @@ __all__ = [
     "validate_extension_config",
 ]
 
+import importlib
 import importlib.util
 import sys
 import tomllib
@@ -432,6 +434,121 @@ def _load_extension(extension: DiscoveredExtension) -> None:
     finally:
         if not registered:
             _rollback_extension(ext_name)
+
+
+def _purge_bytecode_cache(directory: Path) -> None:
+    """Remove compiled bytecode for a plugin directory.
+
+    ``importlib`` stores ``__pycache__/<name>.<tag>.pyc`` next to the source and
+    trusts it when the recorded source mtime matches. The mtime stamp has a
+    one-second resolution, so two writes inside the same second collide and the
+    second payload would never be compiled. Deleting the cache removes that
+    ambiguity entirely.
+
+    Args:
+        directory: The plugin directory whose ``__pycache__`` should be purged.
+    """
+    cache_dirs = [directory / "__pycache__"]
+    # Also cover a sibling cache for a top-level <name>.py module.
+    for path in cache_dirs:
+        if not path.is_dir():
+            continue
+        for cached in path.glob("*.pyc"):
+            try:
+                cached.unlink()
+            except OSError:
+                logger.debug(f"[LAB HOT RELOAD] Unable to drop bytecode {cached}")
+
+
+def hot_reload_extension(name: str) -> bool:
+    """Reload an extension from disk at runtime (teaching-lab helper).
+
+    This is the enforcement point for the "hot plugin" teaching level: it makes
+    a file that was just written into the extension root take effect immediately
+    by unloading the previously registered plugin and re-executing the module.
+
+    The routine is deliberately tolerant — a partially cleaned module tree can
+    still be re-imported — because the pedagogical goal is to demonstrate that
+    "write a file into the plugin directory -> code executes" is a real path.
+
+    Args:
+        name: An extension identifier, or a relative path underneath the
+            extensions root resolved by the caller.
+
+    Returns:
+        True when a module was found and (re-)executed, False when nothing
+        matching ``name`` exists on disk.
+    """
+    root = Path(__file__).resolve().parent
+    normalized = name.replace("\\", "/").strip("/")
+
+    # Resolve the entrypoint the same way discovery would: either
+    # <root>/<name>/__init__.py or <root>/<name>.py
+    candidates: list[Path] = []
+    raw = Path(normalized)
+    if raw.is_absolute():
+        base = raw
+    else:
+        base = root / normalized
+    candidates.append(base / "__init__.py")
+    candidates.append(base)
+    if base.suffix != ".py":
+        candidates.append(base.with_suffix(".py"))
+
+    entrypoint = next((path for path in candidates if path.is_file()), None)
+    if entrypoint is None:
+        return False
+
+    directory = entrypoint.parent
+    # Extension identifiers mirror directory names; derive it from the path so
+    # that a raw file such as "evil_plugin/__init__.py" still reloads the
+    # identifier "evil_plugin".
+    if entrypoint.name == "__init__.py":
+        identifier = directory.name
+    else:
+        identifier = entrypoint.stem
+
+    # 1) Drop any previously registered plugin so pluggy does not keep stale hooks.
+    if pm.has_plugin(identifier):
+        pm.unregister(name=identifier)
+
+    # 2) Purge the module and all of its submodules from the import cache;
+    #    otherwise the loader would return the cached (old) module object.
+    for module_name in [
+        key
+        for key in list(sys.modules)
+        if key == identifier or key.startswith(f"{identifier}.")
+    ]:
+        del sys.modules[module_name]
+
+    # 2b) Drop stale bytecode. SourceFileLoader validates __pycache__/*.pyc by
+    #     mtime with one-second granularity, so an attacker (or a student)
+    #     overwriting the same plugin twice within the same second would have
+    #     the second payload silently ignored. Removing the cache forces a
+    #     genuine re-compile of the new source -- which is what makes the
+    #     "upload again to take effect immediately" teaching step truthful.
+    _purge_bytecode_cache(directory)
+    importlib.invalidate_caches()
+
+    # 3) Re-execute from disk. Module-level statements run here, which is
+    #    exactly the code-execution primitive this teaching level demonstrates.
+    spec = importlib.util.spec_from_file_location(identifier, entrypoint)
+    if spec is None or spec.loader is None:
+        return False
+    spec.submodule_search_locations = [str(directory)]
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[identifier] = module
+    try:
+        spec.loader.exec_module(module)
+    except Exception:
+        # Leave the module registered so its side effects (already executed
+        # before the exception) remain observable during the lab session.
+        raise
+    pm.register(module, name=identifier)
+    logger.warning(
+        f"[LAB HOT RELOAD] Extension {identifier!r} reloaded from {entrypoint}"
+    )
+    return True
 
 
 def _find_dependency_cycle(

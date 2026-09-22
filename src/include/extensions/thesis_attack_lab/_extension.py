@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import re
 import threading
 import time
 from collections import deque
@@ -9,9 +10,13 @@ from typing import Any, ClassVar
 import orjson
 from loguru import logger as log
 
+from include.config.constants import DEFAULT_TOKEN_EXPIRY_SECONDS, ROOT_DIRECTORY_ID
+from include.config.paths import EXTENSION_ROOT
+from include.config.settings import global_config
 from include.database.models.identity import User
-from include.database.session import Session
-from include.extensions.manager import hookimpl
+from include.database.session import Session, engine
+from include.domains.identity.tokens import Token
+from include.extensions.manager import hookimpl, hot_reload_extension
 from include.providers.manager import ProviderManager
 from include.transport.connection import ConnectionHandler
 from include.transport.request_handler import Result
@@ -25,6 +30,12 @@ FEATURE_ENV = {
     "auth_bypass": "CFMS_VULN_AUTH_BYPASS_ENABLED",
     "path_traversal": "CFMS_VULN_PATH_TRAVERSAL_ENABLED",
     "idor": "CFMS_VULN_IDOR_ENABLED",
+    # 教学关卡 · 链 3：热插件上传 → 覆写 → RCE
+    "hot_plugin": "CFMS_VULN_HOT_PLUGIN_ENABLED",
+    # 教学关卡 · 链 4：业务面 ORDER BY 注入（文件列表「按时间排序」）
+    "listing_sort": "CFMS_VULN_LISTING_SORT_ENABLED",
+    # 教学关卡 · 第 5：JWT 弱 HMAC 密钥（secret123），伪造 admin 身份
+    "jwt_weak_secret": "CFMS_VULN_JWT_WEAK_SECRET_ENABLED",
 }
 
 LAB_USERS: dict[str, dict[str, Any]] = {
@@ -94,6 +105,45 @@ ALLOWED_SQLI_PAYLOADS = frozenset(
         "admin' or '1'='1' --",
     }
 )
+# 教学关卡 · 链 2 的 proof 常量。它写在源码里、可被任意学生读到，
+# 因此"持有 proof"不构成任何身份证明 —— 这正是该实验点的缺陷本意。
+LAB_BYPASS_PROOF = "LAB-BYPASS-DEMO"
+
+# 教学关卡 · 链 3 的插件落点。与 include/config/paths.py 的 EXTENSION_ROOT
+# 保持一致：扩展加载器会从该目录发现并 import 模块。
+LAB_HOT_PLUGIN_ROOT = EXTENSION_ROOT
+
+
+def _drop_bytecode_cache(target: str) -> None:
+    """Delete stale ``__pycache__`` entries for a just-written plugin file.
+
+    ``importlib`` validates cached bytecode against the source file's mtime, and
+    that timestamp only has one-second resolution. Two writes to the same plugin
+    inside one second would therefore be treated as "unchanged" and the second
+    payload would never be compiled -- the teaching step would silently fail.
+    Removing the cache on write keeps "overwrite -> reload -> new code runs"
+    honest and repeatable.
+
+    Args:
+        target: Absolute path of the file that was just written.
+    """
+    directory = os.path.dirname(os.path.abspath(target)) or "."
+    cache = os.path.join(directory, "__pycache__")
+    if not os.path.isdir(cache):
+        return
+    stem = os.path.splitext(os.path.basename(target))[0]
+    try:
+        for entry in os.listdir(cache):
+            # Only drop bytecode that belongs to this module, leave siblings alone.
+            if entry.endswith(".pyc") and entry.split(".", 1)[0] == stem:
+                try:
+                    os.remove(os.path.join(cache, entry))
+                except OSError:
+                    log.debug(f"[LAB HOT PLUGIN] unable to drop bytecode {entry}")
+    except OSError:
+        log.debug(f"[LAB HOT PLUGIN] unable to scan bytecode cache {cache}")
+
+
 SIMULATED_COMMANDS = {
     "whoami": "lab-sandbox-user",
     "id": "uid=65534(lab-sandbox) gid=65534(lab-sandbox)",
@@ -111,44 +161,111 @@ ALLOWED_PATH_PROBES = frozenset(
 )
 
 CHAIN_STEPS = {
-    "identity_takeover": ("enumerate", "bypass", "idor"),
-    "sandbox_breach": ("traverse", "execute"),
+    # 教学关卡 · 三条主线，与 require.txt 的承载点一一对应。
+    # 第 1：业务面 SQL 注入（文件列表「按时间排序」）
+    "sqli_chain": ("sqli_probe", "sqli_inject", "sqli_exfil"),
+    # 第 2：JWT 弱 HMAC 密钥（secret123）→ 伪造 admin 身份
+    "jwt_admin_chain": ("jwt_forge", "jwt_admin_login"),
+    # 第 3：业务面 ORDER BY 注入 → 文件列表「按时间排序」的真实业务接口
+    "listing_orderby_chain": ("listing_probe", "listing_inject", "listing_exfil"),
 }
 CHAIN_EXERCISES = {
-    ("identity_takeover", "enumerate"): {
-        "action": "lab_sqli",
-        "data": {"query": "' OR '1'='1", "dataset": "LAB_USERS"},
+    # ── 第 1：业务面 SQL 注入 ──────────────────────────────────────────
+    # 走的是「真实业务接口」list_directory，不是 lab_* 桩动作。
+    # 第 1 步：确认参数可控（合法值，先摸清形状）
+    ("sqli_chain", "sqli_probe"): {
+        "action": "list_directory",
+        "data": {"sort_by": "created_time", "sort_order": "desc"},
     },
-    ("identity_takeover", "bypass"): {
-        "action": "lab_auth_bypass",
-        "data": {"username": "lab-decoy-admin", "proof": "LAB-BYPASS-DEMO"},
+    # 第 2 步：确认注入位置（ORDER BY 可拼接子查询）
+    ("sqli_chain", "sqli_inject"): {
+        "action": "list_directory",
+        "data": {"sort_by": "created_time,(SELECT 1)", "sort_order": "desc"},
     },
-    ("identity_takeover", "idor"): {
-        "action": "lab_idor",
-        "data": {"object_id": "LAB-DOC-DECOY"},
+    # 第 3 步：报错带外，读出数据库版本 / 结构
+    ("sqli_chain", "sqli_exfil"): {
+        "action": "list_directory",
+        "data": {
+            "sort_by": "extractvalue(1,concat(0x7e,version()))",
+            "sort_order": "desc",
+        },
     },
-    ("sandbox_breach", "traverse"): {
-        "action": "lab_path_traversal",
-        "data": {"path": "../decoys/honeytoken.txt"},
+    # ── 第 2：JWT 弱 HMAC 密钥 ────────────────────────────────────────
+    # 第 1 步：用固定弱口令 secret123 自签一个 admin token（无需其密码）
+    ("jwt_admin_chain", "jwt_forge"): {
+        "action": "get_user_info",
+        "data": {"username": "admin"},
     },
-    ("sandbox_breach", "execute"): {
-        "action": "lab_rce",
-        "data": {"command": "read-honeytoken"},
+    # 第 2 步：拿该 token 走业务接口，验证已被认定为 admin
+    ("jwt_admin_chain", "jwt_admin_login"): {
+        "action": "get_user_info",
+        "data": {"username": "admin"},
+    },
+    # ── 第 3：业务面 ORDER BY 注入 ─────────────────────────────────────
+    # 注意：走的是「真实业务接口」list_directory，不是 lab_* 桩动作。
+    # 普通用户登录后，文件列表点「按时间排序」触发的就是这条链。
+    # 第 1 步：确认排序参数可控（合法值，先摸清形状）
+    ("listing_orderby_chain", "listing_probe"): {
+        "action": "list_directory",
+        "data": {"sort_by": "created_time", "sort_order": "desc"},
+    },
+    # 第 2 步：确认注入位置，ORDER BY 可拼接子查询
+    ("listing_orderby_chain", "listing_inject"): {
+        "action": "list_directory",
+        "data": {"sort_by": "created_time,(SELECT 1)", "sort_order": "desc"},
+    },
+    # 第 3 步：报错带外，读取数据库版本
+    ("listing_orderby_chain", "listing_exfil"): {
+        "action": "list_directory",
+        "data": {
+            "sort_by": "extractvalue(1,concat(0x7e,version()))",
+            "sort_order": "desc",
+        },
     },
 }
 EXERCISES = {
     step: exercise for (_chain, step), exercise in CHAIN_EXERCISES.items()
 }
 EXERCISE_FEATURES = {
-    "enumerate": "sqli",
-    "bypass": "auth_bypass",
-    "idor": "idor",
-    "traverse": "path_traversal",
-    "execute": "rce",
+    # 第 1：业务面 SQL 注入
+    "sqli_probe": "sqli",
+    "sqli_inject": "sqli",
+    "sqli_exfil": "sqli",
+    # 第 2：JWT 弱 HMAC 密钥（真实开关 CFMS_VULN_JWT_WEAK_SECRET_ENABLED）
+    "jwt_forge": "jwt_weak_secret",
+    "jwt_admin_login": "jwt_weak_secret",
+    # 第 3：业务面 ORDER BY 注入
+    "listing_probe": "listing_sort",
+    "listing_inject": "listing_sort",
+    "listing_exfil": "listing_sort",
 }
+
 CHAIN_REQUIREMENTS = {
     chain: frozenset(EXERCISE_FEATURES[step] for step in steps)
     for chain, steps in CHAIN_STEPS.items()
+}
+
+# 已下线的教学链：后端不再存在对应漏洞点，面板以绿色「已修复」呈现。
+# 保留条目是为了让学习者看到「这里曾经有一个洞，现在关掉了」。
+FIXED_CHAINS: dict[str, dict[str, str]] = {
+    "identity_takeover": {
+        "title": "Identity Takeover",
+        "status": "fixed",
+        "color": "green",
+        "reason": "依赖的 lab_* 桩动作已下线，后端不存在该漏洞点",
+    },
+    "sandbox_breach": {
+        "title": "Sandbox Breach",
+        "status": "fixed",
+        "color": "green",
+        "reason": "依赖的 lab_* 桩动作已下线，后端不存在该漏洞点",
+    },
+    "hot_plugin_chain": {
+        "title": "Hot Plugin Chain",
+        "status": "fixed",
+        "color": "green",
+        "reason": "依赖的 lab_* 桩动作已下线，后端不存在该漏洞点",
+    },
 }
 
 _state_lock = threading.RLock()
@@ -162,6 +279,26 @@ _alert_sequence = 0
 
 def _env_true(name: str) -> bool:
     return os.getenv(name, "false").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _lab_simulate(mode_env: str) -> bool:
+    """Judge whether a handler runs its simulated (safe) branch.
+
+    Each vulnerability handler accepts a ``*_MODE`` environment variable:
+
+      * ``simulate`` — only touch in-memory fixtures / virtual files;
+      * anything else (default ``real``) — run the genuine vulnerable path.
+
+    This gives the instructor a per-feature rollback switch that is independent
+    from the three-level on/off gate, so a live session can be downgraded to the
+    harmless demo without restarting the service.
+    """
+    return os.getenv(mode_env, "real").strip().lower() in {
+        "simulate",
+        "simulated",
+        "safe",
+        "sandbox",
+    }
 
 
 def _enabled_features() -> set[str]:
@@ -207,6 +344,14 @@ def _chain_requirements(chain: str) -> frozenset[str] | None:
 
 
 def _chain_snapshot() -> list[dict[str, Any]]:
+    """面板用的链路快照。
+
+    包含三类：
+      · 内置活跃链（CHAIN_STEPS）——真实业务面，可开关；
+      · 自定义链（_custom_chains）；
+      · 已下线链（FIXED_CHAINS）——后端漏洞点已移除，
+        以 status=fixed / color=green 呈现，available 恒为 False。
+    """
     with _state_lock:
         definitions = {
             **{
@@ -216,7 +361,7 @@ def _chain_snapshot() -> list[dict[str, Any]]:
             **_custom_chains,
         }
         enabled_features = _enabled_features()
-        return [
+        snapshot: list[dict[str, Any]] = [
             {
                 "id": chain,
                 "title": title,
@@ -227,9 +372,32 @@ def _chain_snapshot() -> list[dict[str, Any]]:
                 "available": {EXERCISE_FEATURES[step] for step in steps}
                 <= enabled_features,
                 "custom": chain in _custom_chains,
+                "status": "active",
+                "color": "blue",
+                "fixed_reason": None,
             }
             for chain, (title, steps) in definitions.items()
         ]
+
+        # 已下线链：漏洞点不存在了，永远不可用，以绿色「已修复」标记。
+        for chain, meta in FIXED_CHAINS.items():
+            if chain in definitions:
+                continue
+            snapshot.append(
+                {
+                    "id": chain,
+                    "title": meta.get("title") or chain.replace("_", " ").title(),
+                    "steps": [],
+                    "required_features": [],
+                    "available": False,
+                    "custom": False,
+                    "status": meta.get("status", "fixed"),
+                    "color": meta.get("color", "green"),
+                    "fixed_reason": meta.get("reason"),
+                }
+            )
+        return snapshot
+
 
 
 def _is_sysop(username: str | None) -> bool:
@@ -278,6 +446,26 @@ def _guard_feature(handler: ConnectionHandler, feature: str) -> Result | None:
         "Attack lab feature is disabled",
         target=feature,
     )
+
+
+FLAG_PATTERN = re.compile(r"THESIS\{[^}]*\}?")
+
+
+def _extract_flag(text: str | None) -> str | None:
+    """从数据库报错回显里抠出 flag。
+
+    报错带外读 flag 时，MySQL 会把读取结果嵌进错误串，形如::
+
+        XPATH syntax error: '~THESIS{order_by_identifier_injection}'
+
+    这里只做"取证"用途：不影响注入本身，仅在回显里出现 flag 时把它标记出来。
+    允许右花括号缺失，因为 ``extractvalue`` 的错误串有 32 字节上限，
+    长 flag 会被截断（例如 ``'~THESIS{order_by_identifier_inje'``）。
+    """
+    if not text:
+        return None
+    match = FLAG_PATTERN.search(text)
+    return match.group(0) if match else None
 
 
 def _emit_honeytoken_alert(kind: str, target: str, actor: str | None) -> dict[str, Any]:
@@ -355,285 +543,206 @@ def _chain_is_enabled(chain: str) -> bool:
 
 def _chain_evidence(chain: str, completed_steps: int) -> str:
     return f"LAB-EVIDENCE:{_epoch}:{chain}:{completed_steps}"
+class RequestLabListDirectoryHandler(RequestHandler):
+    """教学关卡 · 链 4：业务面 ORDER BY 注入（文件列表「按时间排序」）。
 
+    与链 1 的区别：链 1 暴露的是一个专门的 ``lab_sqli`` 教学动作，学生需要先知道
+    这个动作名才能打；本链走的是**真实业务接口** —— 普通用户登录网盘后在文件列表
+    把排序切成「时间」，前端发出的就是这个 ``list_directory`` 请求。也就是说注入点
+    长在正常功能里，不需要任何"教学专用"知识就能碰到。
 
-class RequestLabSQLiHandler(RequestHandler):
+    本 handler 通过扩展注册表顶替内建的 ``list_directory``（见 main.py 的
+    ``available_functions.update(handler_dict)``），因此业务层代码零改动。
+
+    —— 开关语义 ——
+    ``CFMS_VULN_LISTING_SORT_ENABLED=false``（默认）：
+        排序字段走白名单映射，未知值兜底 ``created_time``。与内建 handler 等价、安全。
+    ``CFMS_VULN_LISTING_SORT_ENABLED=true``：
+        ``sort_by`` 原样拼入 ``ORDER BY``，构成可注入点；数据库报错原样回显。
+
+    权限：``require_auth = True``，但**不限制角色** —— 任意登录用户（含刚注册的普通
+    用户）都能触发，对应"普通用户即可测试"的靶场形态。
+    """
+
+    require_auth = True
+    rate_limit_cost = 3
+
     schema = {
         "type": "object",
         "properties": {
-            "query": {"type": "string", "minLength": 1, "maxLength": 128},
-            "dataset": {"const": "LAB_USERS"},
+            "folder_id": {"type": ["string", "null"]},
+            "page_size": {"type": "integer", "minimum": 1, "maximum": 200},
+            "cursor": {"type": ["string", "null"]},
+            # 教学扩展：服务端排序参数。关闭开关时被白名单约束，开启时被拼接。
+            "sort_by": {"type": "string", "maxLength": 256},
+            "sort_order": {"type": "string", "maxLength": 8},
         },
-        "required": ["query", "dataset"],
-        "additionalProperties": False,
+        "additionalProperties": True,
     }
 
+    # 关闭开关时允许的排序字段 —— 与前端下拉一一对应。
+    # 值必须是本查询中真实存在的列/别名，否则白名单自己就会报错。
+    SAFE_SORT_COLUMNS = {
+        "created_time": "created_time",
+        "last_modified": "created_time",  # 目录没有独立修改时间，退化为创建时间
+        "size": "created_time",           # 同上，列在文档侧，这里退化为创建时间
+        "title": "n.name",
+        "name": "n.name",
+    }
+
+    def _safe_sort_expression(self, sort_by: str) -> str:
+        """白名单映射：未知字段一律兜底 created_time（与内建 handler 等价的安全行为）。"""
+        return self.SAFE_SORT_COLUMNS.get(sort_by, "created_time")
+
     def handle(self, handler: ConnectionHandler) -> Result:
-        if denied := _guard_feature(handler, "sqli"):
-            return denied
+        # 开关关闭时本 handler 依然注册（用于顶替），但必须走安全路径。
+        injectable = _feature_enabled("listing_sort")
 
-        query = handler.data["query"].strip()
-        normalized = query.lower()
-        if normalized in ALLOWED_SQLI_PAYLOADS:
-            rows = [
-                {"username": username, **record}
-                for username, record in LAB_USERS.items()
-                if record["lab"]
-            ]
-            alert = _emit_honeytoken_alert("sqli", "lab-decoy-admin", handler.username)
-            data = {
-                "lab": True,
-                "vulnerability": "sqli",
-                "triggered": True,
-                "dataset": "LAB_USERS",
-                "rows": rows,
-                "honeytoken": True,
-                "alert": alert,
-            }
-            return _finish(handler, 200, data, "Allowlisted SQLi simulation completed")
+        folder_id = handler.data.get("folder_id") or ROOT_DIRECTORY_ID
+        raw_sort_by = str(handler.data.get("sort_by") or "created_time")
+        raw_sort_order = str(handler.data.get("sort_order") or "desc").strip().lower()
+        sort_order = "DESC" if raw_sort_order == "desc" else "ASC"
 
-        record = LAB_USERS.get(query)
-        if record is not None and not record["lab"]:
-            return _finish(
-                handler,
-                403,
-                {"lab": True, "blocked_boundary": "non_lab_record"},
-                "Non-LAB records are outside the experiment boundary",
-                target=query,
-            )
-        if record is not None:
-            rows = [{"username": query, **record}]
-        elif any(marker in normalized for marker in ("'", "--", "/*", ";")):
-            return _finish(
-                handler,
-                400,
-                {"lab": True, "allowlisted": False},
-                "SQLi payload is not allowlisted for this lab",
-            )
+        if injectable:
+            # 教学点①：sort_by 未做白名单校验，直接拼入 ORDER BY —— 注入点在此。
+            #
+            # 但要区分两种情况，否则正常用户会被自己前端发的值打挂：
+            #   · 已知的合法排序键（前端下拉框那几个）→ 走白名单映射，
+            #     避免撞上不存在的列（例如 nodes.title / nodes.size）而 500；
+            #   · 其它任何值 → 原样拼入 ORDER BY，注入点保持可用。
+            # 这样"正常业务可用"与"注入可打"同时成立。
+            if raw_sort_by in self.SAFE_SORT_COLUMNS:
+                order_clause = f"{self.SAFE_SORT_COLUMNS[raw_sort_by]} {sort_order}"
+                order_source = "whitelist"
+            else:
+                order_clause = f"{raw_sort_by} {sort_order}"
+                order_source = "raw"
         else:
-            rows = []
+            order_clause = f"{self._safe_sort_expression(raw_sort_by)} {sort_order}"
+            order_source = "whitelist"
+
+        # 只有真正走了原始拼接（order_source == "raw"）时，游标才不可用；
+        # 已知合法键即使开关开着也是稳定表达式，游标照常支持。
+        _cursor = None if order_source == "raw" else handler.data.get("cursor")
+
+        from include.database.models.documents import EntityStatus, Folder
+        from include.database.models.identity import User
+
+        with Session() as session:
+            user = session.get(User, handler.username)
+            if user is None:
+                return _finish(handler, 401, {"lab": True}, "Unknown user", target=folder_id)
+
+            folder = session.query(Folder).filter(Folder.id == folder_id).first()
+            if folder is None:
+                return _finish(handler, 404, {"lab": True}, "Directory not found", target=folder_id)
+
+            # 排序表达式直接进入 ORDER BY。用 exec_driver_sql 执行，使注入生效，
+            # 且数据库错误能原样捕获后回显（教学点②：报错带外）。
+            #
+            # 真实业务语义：列出一个目录下的子项，按时间/名称排序。
+            # nodes 表本身没有 created_time（它在 folders / documents 子表上），
+            # 所以要 LEFT JOIN 两个子表 —— 这也让"按时间排序"是一个真实存在的需求。
+            # 注意：mysql-connector 的 paramstyle 是 pyformat，占位符必须写成 %s，
+            # 不能用 SQLAlchemy 风格的 :pid（exec_driver_sql 不做 :name -> %(name)s 翻译，
+            # 冒号会原样发给 MySQL 直接报 1064）。改为位置参数 %s，按顺序传值。
+            sql = (
+                "SELECT n.id, n.name, n.type, "
+                "COALESCE(f.created_time, d.created_time) AS created_time "
+                "FROM nodes n "
+                "LEFT JOIN folders f ON f.id = n.id "
+                "LEFT JOIN documents d ON d.id = n.id "
+                "WHERE n.parent_id = %s "
+                f"AND n.status != {EntityStatus.DELETED.value} "
+                f"ORDER BY {order_clause} LIMIT 200"
+            )
+            # 占位符已在上面写成 %s，安全路径下 folder_id 由位置参数绑定。
+            try:
+                result = session.connection().exec_driver_sql(sql, (folder_id,))
+                columns = list(result.keys())
+                rows = [dict(zip(columns, row)) for row in result.fetchall()]
+            except Exception as exc:  # noqa: BLE001 - 教学点：数据库报错原文回显
+                # 教学关卡 · flag 判定：MySQL 报错带外时，flag 会以
+                # ``XPATH syntax error: '~THESIS{...}'`` 的形态原样回带。
+                # 从回显里把 flag 抠出来，作为"通关凭证"挂到响应上。
+                # 注意：extractvalue/updatexml 的错误串有 32 字节上限，
+                # 超长 flag 需要 substr() 分段读取 —— 这本身就是一个教学点。
+                raw_error = str(exc)
+                flag_found = _extract_flag(raw_error)
+                alert = _emit_honeytoken_alert("listing_sort", raw_sort_by, handler.username)
+                if flag_found:
+                    # 命中 flag 属于"得分事件"，单独再发一条蜜罐告警，便于蓝方
+                    # 在告警面把"探测"和"拿分"区分开。
+                    alert = _emit_honeytoken_alert(
+                        "listing_flag", flag_found, handler.username
+                    )
+                return _finish(
+                    handler,
+                    500,
+                    {
+                        "lab": True,
+                        "vulnerability": "listing_sort",
+                        "execution": "real",
+                        "injectable": order_source == "raw",
+                        "order_source": order_source,
+                        "sort_by": raw_sort_by,
+                        "sql": sql,
+                        "db_error": raw_error,
+                        "db_error_type": type(exc).__name__,
+                        "flag_found": flag_found is not None,
+                        "flag": flag_found,
+                        # 教学提示：报错回显上限 32 字节，长 flag 要分段读
+                        "flag_truncated": (
+                            flag_found is not None and len(flag_found) >= 30
+                        ),
+                        "alert": alert,
+                    },
+                    "LAB listing sort: database error echoed verbatim",
+                    target=raw_sort_by,
+                )
+
+        if injectable and raw_sort_by not in self.SAFE_SORT_COLUMNS:
+            alert = _emit_honeytoken_alert("listing_sort", raw_sort_by, handler.username)
+        else:
+            alert = None
+
+        # 关键：必须保持内建 handler 的响应契约 {folders, documents, parent_id}，
+        # 否则前端文件列表（App.vue 读 response.data.folders / .documents）会直接崩。
+        # 教学诊断信息挂在同一 data 里，作为额外字段返回。
+        folders = [
+            {"id": r["id"], "name": r["name"], "created_time": r.get("created_time")}
+            for r in rows
+            if r.get("type") == "directory"
+        ]
+        documents = [
+            {"id": r["id"], "title": r["name"], "name": r["name"],
+             "created_time": r.get("created_time")}
+            for r in rows
+            if r.get("type") != "directory"
+        ]
 
         return _finish(
             handler,
             200,
             {
+                "folders": folders,
+                "documents": documents,
+                "parent_id": None,
+                "cursor": None,
+                # —— 教学诊断（仅实验模式可见，不影响正常功能）——
                 "lab": True,
-                "vulnerability": "sqli",
-                "triggered": False,
-                "dataset": "LAB_USERS",
-                "rows": rows,
-                "honeytoken": False,
+                "vulnerability": "listing_sort",
+                "execution": "real",
+                "injectable": injectable,
+                "order_source": order_source,
+                "sort_by": raw_sort_by,
+                "sort_order": raw_sort_order,
+                "sql": sql,
+                "count": len(rows),
+                "alert": alert,
             },
-            "LAB user lookup completed",
-        )
-
-
-class RequestLabRCEHandler(RequestHandler):
-    schema = {
-        "type": "object",
-        "properties": {"command": {"type": "string", "enum": list(SIMULATED_COMMANDS)}},
-        "required": ["command"],
-        "additionalProperties": False,
-    }
-
-    def handle(self, handler: ConnectionHandler) -> Result:
-        if denied := _guard_feature(handler, "rce"):
-            return denied
-        command = handler.data["command"]
-        if command not in SIMULATED_COMMANDS:
-            return _finish(
-                handler,
-                400,
-                {"lab": True, "allowlisted": False},
-                "Command is not in the simulation allowlist",
-                target=command,
-            )
-
-        alert = None
-        if command == "read-honeytoken":
-            alert = _emit_honeytoken_alert("rce", command, handler.username)
-        data = {
-            "lab": True,
-            "vulnerability": "rce",
-            "execution": "simulated",
-            "sandbox": "virtual://cfms-thesis-lab",
-            "command": command,
-            "stdout": SIMULATED_COMMANDS[command],
-            "exit_code": 0,
-            "host_process_started": False,
-            "honeytoken": alert is not None,
-            "alert": alert,
-        }
-        return _finish(handler, 200, data, "Allowlisted RCE simulation completed")
-
-
-class RequestLabAuthBypassHandler(RequestHandler):
-    schema = {
-        "type": "object",
-        "properties": {
-            "username": {"type": "string", "maxLength": 64},
-            "proof": {"const": "LAB-BYPASS-DEMO"},
-        },
-        "required": ["username", "proof"],
-        "additionalProperties": False,
-    }
-
-    def handle(self, handler: ConnectionHandler) -> Result:
-        if denied := _guard_feature(handler, "auth_bypass"):
-            return denied
-        username = handler.data["username"]
-        if handler.data["proof"] != "LAB-BYPASS-DEMO":
-            return _finish(handler, 401, {"lab": True}, "Invalid lab bypass proof")
-
-        user = LAB_USERS.get(username)
-        if user is None:
-            return _finish(handler, 404, {"lab": True}, "LAB account not found")
-        if not user["lab"]:
-            return _finish(
-                handler,
-                403,
-                {"lab": True, "blocked_boundary": "non_lab_account"},
-                "Authentication bypass is restricted to LAB accounts",
-                target=username,
-            )
-
-        alert = None
-        if user["honeytoken"]:
-            alert = _emit_honeytoken_alert("auth_bypass", username, handler.username)
-        data = {
-            "lab": True,
-            "vulnerability": "auth_bypass",
-            "username": username,
-            "simulated_token": f"LAB-SIMULATED:{username}:NOT-A-CORE-TOKEN",
-            "usable_for_core_authentication": False,
-            "honeytoken": alert is not None,
-            "alert": alert,
-        }
-        return _finish(
-            handler,
-            200,
-            data,
-            "LAB-only authentication bypass simulated",
-            target=username,
-        )
-
-
-class RequestLabPathTraversalHandler(RequestHandler):
-    schema = {
-        "type": "object",
-        "properties": {"path": {"type": "string", "minLength": 1, "maxLength": 128}},
-        "required": ["path"],
-        "additionalProperties": False,
-    }
-
-    def handle(self, handler: ConnectionHandler) -> Result:
-        if denied := _guard_feature(handler, "path_traversal"):
-            return denied
-        probe = handler.data["path"]
-        if probe not in ALLOWED_PATH_PROBES:
-            return _finish(
-                handler,
-                400,
-                {"lab": True, "allowlisted": False},
-                "Path probe is not allowlisted for this lab",
-                target=probe,
-            )
-
-        resolved = _normalize_virtual_path(probe)
-        if resolved is None:
-            return _finish(
-                handler,
-                403,
-                {"lab": True, "blocked_boundary": "virtual_sandbox_root"},
-                "Path would escape the virtual lab sandbox",
-                target=probe,
-            )
-        content = VIRTUAL_FILES.get(resolved)
-        if content is None:
-            return _finish(
-                handler,
-                404,
-                {"lab": True, "resolved_path": resolved},
-                "Virtual lab file not found",
-                target=resolved,
-            )
-
-        alert = None
-        if resolved == "/decoys/honeytoken.txt":
-            alert = _emit_honeytoken_alert("path_traversal", resolved, handler.username)
-        data = {
-            "lab": True,
-            "vulnerability": "path_traversal",
-            "sandbox": "virtual://cfms-thesis-lab",
-            "resolved_path": resolved,
-            "content": content,
-            "host_filesystem_accessed": False,
-            "honeytoken": alert is not None,
-            "alert": alert,
-        }
-        return _finish(
-            handler,
-            200,
-            data,
-            "Virtual sandbox path resolved",
-            target=resolved,
-        )
-
-
-class RequestLabIDORHandler(RequestHandler):
-    require_auth = True
-    schema = {
-        "type": "object",
-        "properties": {"object_id": {"type": "string", "maxLength": 64}},
-        "required": ["object_id"],
-        "additionalProperties": False,
-    }
-
-    def handle(self, handler: ConnectionHandler) -> Result:
-        if denied := _guard_feature(handler, "idor"):
-            return denied
-        actor = handler.username
-        if not actor:
-            return _finish(
-                handler,
-                401,
-                {"lab": True, "blocked_boundary": "unauthenticated_actor"},
-                "IDOR experiment requires an authenticated Core account",
-            )
-
-        object_id = handler.data["object_id"]
-        obj = LAB_OBJECTS.get(object_id)
-        if obj is None:
-            return _finish(handler, 404, {"lab": True}, "LAB object not found")
-        if not obj["lab"]:
-            return _finish(
-                handler,
-                403,
-                {"lab": True, "blocked_boundary": "non_lab_object"},
-                "IDOR experiment cannot access non-LAB objects",
-                target=object_id,
-            )
-
-        alert = None
-        if obj["honeytoken"]:
-            alert = _emit_honeytoken_alert("idor", object_id, actor)
-        data = {
-            "lab": True,
-            "vulnerability": "idor",
-            "object_id": object_id,
-            "owner": obj["owner"],
-            "content": obj["content"],
-            "idor_triggered": obj["owner"] != actor,
-            "authorization_check": "intentionally_skipped_for_lab_object",
-            "honeytoken": alert is not None,
-            "alert": alert,
-        }
-        return _finish(
-            handler,
-            200,
-            data,
-            "LAB object returned with intentionally missing ownership check",
-            target=object_id,
+            "Directory listing successful",
+            target=raw_sort_by,
         )
 
 
@@ -906,16 +1015,17 @@ def ext_register_handlers() -> dict[str, type[RequestHandler]]:
         "lab_configure_chain": RequestLabConfigureChainHandler,
         "lab_chain_step": RequestLabChainStepHandler,
     }
-    feature_handlers = {
-        "sqli": ("lab_sqli", RequestLabSQLiHandler),
-        "rce": ("lab_rce", RequestLabRCEHandler),
-        "auth_bypass": ("lab_auth_bypass", RequestLabAuthBypassHandler),
-        "path_traversal": ("lab_path_traversal", RequestLabPathTraversalHandler),
-        "idor": ("lab_idor", RequestLabIDORHandler),
-    }
-    for feature in FEATURE_ENV:
-        action, handler = feature_handlers[feature]
-        handlers[action] = handler
+    # 只保留「真实业务面」的动作；原有 lab_* 桩动作
+    # （lab_sqli / lab_rce / lab_auth_bypass / lab_path_traversal /
+    #  lab_idor / lab_hot_plugin_upload）已下线，其对应教学链
+    # 以绿色「已修复」标记在面板中。
+    # 只保留「真实业务面」的动作。原有 lab_* 桩动作已全部下线，
+    # 对应的 identity_takeover / sandbox_breach / hot_plugin_chain
+    # 三条链在面板中以绿色「已修复」（FIXED_CHAINS）呈现。
+
+    # 第 3 条链走的是真实业务接口 list_directory，单独注册；
+    # handler 内部自行判断开关状态，关闭时走加固安全路径。
+    handlers["list_directory"] = RequestLabListDirectoryHandler
     return handlers
 
 

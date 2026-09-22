@@ -145,6 +145,8 @@ def server_init():
             {"permission": Permissions.MANAGE_KEYRINGS},
             {"permission": Permissions.MANAGE_2FA},
             {"permission": Permissions.GET_USER_INFO},
+            {"permission": Permissions.RENAME_USER},
+            {"permission": Permissions.SET_USER_AVATAR},
             {"permission": Permissions.SET_ACCESS_RULES},
             {"permission": Permissions.VIEW_ACCESS_RULES},
             {"permission": Permissions.MANAGE_ACCESS},

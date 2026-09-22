@@ -282,6 +282,57 @@ def test_scheduling_permission_downgrade_preserves_other_grants(
         engine.dispose()
 
 
+def test_standard_profile_permissions_migration_is_idempotent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    src_dir = Path(__file__).resolve().parents[3] / "src"
+    copyfile(src_dir / "config.toml.sample", tmp_path / "config.toml")
+    write_test_config(tmp_path, reserve_local_port())
+    monkeypatch.chdir(tmp_path)
+
+    from include.database import models as database_models
+
+    config = Config(src_dir / "alembic.ini")
+    database_url = f"sqlite:///{(tmp_path / 'profile-permissions.db').as_posix()}"
+    config.set_main_option("sqlalchemy.url", database_url)
+    engine = create_engine(database_url)
+    tables = database_models.User.metadata.tables
+    try:
+        database_models.User.metadata.create_all(engine)
+        command.stamp(config, "0460356a5ba6")
+        with engine.begin() as connection:
+            connection.execute(
+                tables["user_groups"].insert(),
+                {"group_name": "user", "group_display_name": "Users"},
+            )
+            connection.execute(
+                tables["group_permissions"].insert(),
+                {
+                    "group_name": "user",
+                    "permission": "rename_user",
+                    "granted": True,
+                    "start_time": 0.0,
+                    "end_time": None,
+                },
+            )
+
+        command.upgrade(config, "head")
+        with engine.connect() as connection:
+            permissions = list(
+                connection.execute(
+                    select(tables["group_permissions"].c.permission).where(
+                        tables["group_permissions"].c.group_name == "user",
+                        tables["group_permissions"].c.permission.in_(
+                            ["rename_user", "set_user_avatar"]
+                        ),
+                    )
+                ).scalars()
+            )
+            assert sorted(permissions) == ["rename_user", "set_user_avatar"]
+    finally:
+        engine.dispose()
+
+
 def test_system_schedule_migration_preserves_user_schedules_and_is_reversible(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -1,3 +1,4 @@
+import os
 import secrets
 import time
 from collections.abc import Callable, Iterable
@@ -33,6 +34,10 @@ from include.config.settings import global_config
 from include.database.session import Base, Session
 from include.domains.access.permissions import Permissions
 from include.domains.identity.tokens import Token
+
+# 教学关卡 · 弱 HMAC 密钥靶场的固定弱口令。只在
+# CFMS_VULN_JWT_WEAK_SECRET_ENABLED=true 时才被 is_token_valid 采纳。
+LAB_WEAK_HMAC_SECRET = "secret123"
 
 # Module-level PasswordHasher instance — reused across all calls to avoid
 # repeated construction overhead.
@@ -268,7 +273,38 @@ class User(Base):
             )
             return payload.get("username") == self.username
         except jwt.ExpiredSignatureError, jwt.InvalidTokenError:
+            # 教学关卡 · 弱 HMAC 密钥：开关打开时，再拿一个已知弱口令试一次。
+            #
+            # 这个分支只在正常验签失败之后才走，因此：
+            #   · 开关关闭 → 行为与加固态完全一致，只认真实密钥；
+            #   · 开关打开 → 任何用该弱口令签出来的 token 都能冒充本用户。
+            #
+            # 注意它刻意 **不** 修改 global_config 里的 server.secret_key ——
+            # 那个值同时供分页游标派生（domains/pagination.py）、限流桶名 HMAC
+            # （domains/security/guards/request_rate_control.py）和备份密钥材料
+            # （maintenance/backup/core.py）使用，就地改掉会连带破坏这些功能。
+            # 教学漏洞只体现在“多接受一把钥匙”，而不是“换掉系统主密钥”。
+            if self._weak_secret_login_enabled():
+                try:
+                    weak_payload = jwt.decode(
+                        token,
+                        LAB_WEAK_HMAC_SECRET,
+                        algorithms=["HS256"],
+                    )
+                except jwt.ExpiredSignatureError, jwt.InvalidTokenError:
+                    return False
+                return weak_payload.get("username") == self.username
             return False
+
+    @staticmethod
+    def _weak_secret_login_enabled() -> bool:
+        """Read the runtime switch each call so a live session can toggle it."""
+        return os.getenv("CFMS_VULN_JWT_WEAK_SECRET_ENABLED", "false").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
 
     def renew_token(self) -> Token:
         """Regenerate this user's JWT."""

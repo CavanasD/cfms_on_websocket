@@ -64,3 +64,11 @@ package.json
 
 # Server runtime
 *.lock
+
+# ── 本地实验备份（带时间戳的临时副本，勿入库）─────────────
+*.bak
+*.bak.*
+*.bak_*
+*.bak2_*
+*.bak3_*
+_extension.py.bak*
