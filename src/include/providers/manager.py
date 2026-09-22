@@ -6,6 +6,8 @@ from include.providers.base import (
     CachingProvider,
     EventBusProvider,
     Provider,
+    RateLimitProvider,
+    SchedulingProvider,
     StorageProvider,
 )
 
@@ -21,7 +23,7 @@ class ProviderManager:
 
     def __new__(cls):
         if not hasattr(cls, "_instance"):
-            cls._instance = super(ProviderManager, cls).__new__(cls)
+            cls._instance = super().__new__(cls)
         return cls._instance
 
     def __init__(self):
@@ -50,3 +52,11 @@ class ProviderManager:
     @property
     def caching(self) -> CachingProvider:
         return self.get(CachingProvider)
+
+    @property
+    def rate_limit(self) -> RateLimitProvider:
+        return self.get(RateLimitProvider)
+
+    @property
+    def scheduling(self) -> SchedulingProvider:
+        return self.get(SchedulingProvider)

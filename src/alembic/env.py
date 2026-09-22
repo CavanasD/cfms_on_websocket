@@ -18,26 +18,9 @@ if config.config_file_name is not None:
 # for 'autogenerate' support
 # from myapp import mymodel
 # target_metadata = mymodel.Base.metadata
-from include.database.handler import Base
-from include.database.models.blocking import UserBlockEntry, UserBlockSubEntry
-from include.database.models.classic import (
-    User,
-    UserGroup,
-    UserGroupPermission,
-    UserPermission,
-    UserMembership,
-)
-from include.database.models.file import File, FileTask
-from include.database.models.entity import (
-    BaseObject,
-    Document,
-    DocumentRevision,
-    DocumentAccessRule,
-    Folder,
-    FolderAccessRule,
-)
-from include.database.models.keyring import UserKey
-from include.database.models.security import BannedSubnet, LoginThrottle, TrafficThrottle
+import include.database.models  # noqa: F401
+
+from include.database.session import Base
 
 target_metadata = Base.metadata
 
@@ -79,6 +62,17 @@ def run_migrations_online() -> None:
     and associate a connection with the context.
 
     """
+    supplied_connection = config.attributes.get("connection")
+    if supplied_connection is not None:
+        context.configure(
+            connection=supplied_connection,
+            target_metadata=target_metadata,
+            render_as_batch=True,
+        )
+        with context.begin_transaction():
+            context.run_migrations()
+        return
+
     connectable = engine_from_config(
         config.get_section(config.config_ini_section, {}),
         prefix="sqlalchemy.",

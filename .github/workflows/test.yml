@@ -8,6 +8,7 @@ on:
     branches: [ "**" ]
   pull_request:
     branches: [ "**" ]
+  workflow_call:
 
 jobs:
   test:
@@ -15,10 +16,13 @@ jobs:
     
     strategy:
       matrix:
-        python-version: ["3.13", "3.14"]
+        python-version: ["3.14"]
     
     steps:
     - uses: actions/checkout@v6
+      with:
+        fetch-depth: 0
+        submodules: recursive
     
     - name: Set up Python ${{ matrix.python-version }}
       uses: actions/setup-python@v6
@@ -26,23 +30,33 @@ jobs:
         python-version: ${{ matrix.python-version }}
 
     - name: Set up uv
-      run: |
-        python -m pip install --upgrade pip
-        pip install uv
+      uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+      with:
+        version: "0.11.16"
     
     - name: Install dependencies
       run: |
-        uv sync --dev
-    
-    - name: Create necessary directories
+        uv sync --locked --dev --all-extras
+
+    - name: Check changelog fragment
+      if: github.event_name == 'pull_request' && !contains(github.event.pull_request.labels.*.name, 'skip-changelog')
+      env:
+        BASE_REF: ${{ github.base_ref }}
       run: |
-        mkdir -p src/content/ssl
-        mkdir -p src/content/logs
+        uv run --locked towncrier check --compare-with "origin/${BASE_REF}"
     
     - name: Run tests with pytest
       run: |
         uv run pytest tests/ -v --tb=short
       timeout-minutes: 10
+
+    - name: Verify test configuration cleanup
+      if: always()
+      run: |
+        if [ -e src/config.toml ]; then
+          echo "pytest left src/config.toml behind" >&2
+          exit 1
+        fi
     
     - name: Upload test results
       if: always()
@@ -54,3 +68,127 @@ jobs:
           src/content/logs/
           test_logs/
         retention-days: 7
+
+  mysql-database-migration:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        mysql-version: ["8.4", "9.7"]
+    services:
+      mysql:
+        image: mysql:${{ matrix.mysql-version }}
+        env:
+          MYSQL_DATABASE: cfms_migration
+          MYSQL_USER: cfms
+          MYSQL_PASSWORD: cfms-test-password
+          MYSQL_ROOT_PASSWORD: cfms-test-password
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd="mysqladmin ping -h localhost -pcfms-test-password"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=10
+
+    steps:
+    - uses: actions/checkout@v6
+      with:
+        submodules: recursive
+
+    - name: Set up Python 3.14
+      uses: actions/setup-python@v6
+      with:
+        python-version: "3.14"
+
+    - name: Set up uv
+      uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+      with:
+        version: "0.11.16"
+
+    - name: Install test and MySQL dependencies
+      run: uv sync --locked --dev --extra mysql
+
+    - name: Run MySQL integration tests
+      env:
+        CFMS_TEST_MYSQL_URL: "mysql+mysqlconnector://cfms:cfms-test-password@127.0.0.1:3306/cfms_migration?charset=utf8mb4"
+      run: |
+        uv run --locked pytest tests/scheduling/test_engine_shared_database.py -q
+        uv run --locked pytest tests/domains/documents/test_upload_cleanup_mysql.py -q
+        uv run --locked pytest tests/domains/documents/test_rate_limits_mysql.py -q
+        uv run --locked pytest tests/maintenance/test_database_migration_mysql.py -q
+      timeout-minutes: 10
+
+  postgresql-scheduling-concurrency:
+    runs-on: ubuntu-latest
+    services:
+      postgresql:
+        image: postgres:18
+        env:
+          POSTGRES_DB: cfms_scheduling
+          POSTGRES_USER: cfms
+          POSTGRES_PASSWORD: cfms-test-password
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd="pg_isready -U cfms -d cfms_scheduling"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=10
+
+    steps:
+    - uses: actions/checkout@v6
+      with:
+        submodules: recursive
+
+    - name: Set up Python 3.14
+      uses: actions/setup-python@v6
+      with:
+        python-version: "3.14"
+
+    - name: Set up uv
+      uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+      with:
+        version: "0.11.16"
+
+    - name: Install test and PostgreSQL dependencies
+      run: uv sync --locked --dev --extra postgresql
+
+    - name: Run PostgreSQL scheduling concurrency tests
+      env:
+        CFMS_TEST_POSTGRESQL_URL: "postgresql+psycopg2://cfms:cfms-test-password@127.0.0.1:5432/cfms_scheduling"
+      run: uv run --locked pytest tests/scheduling/test_engine_shared_database.py -q
+      timeout-minutes: 10
+
+  release-bundle-smoke:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+
+    steps:
+    - uses: actions/checkout@v6
+      with:
+        submodules: recursive
+
+    - name: Set up Python 3.14
+      uses: actions/setup-python@v6
+      with:
+        python-version: "3.14"
+
+    - name: Set up uv
+      uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+      with:
+        version: "0.11.16"
+
+    - name: Build and inspect a flat release deployment
+      shell: pwsh
+      run: |
+        $version = uv run --locked python -c "import tomllib; print(tomllib.load(open('pyproject.toml','rb'))['project']['version'])"
+        uv run --locked python tools/build_release.py --version $version --source-date-epoch 1788000000 --output-dir dist
+        $archive = (Resolve-Path "dist/cfms-on-websocket-$version.zip").Path
+        Expand-Archive -LiteralPath $archive -DestinationPath smoke
+        $bundle = (Resolve-Path "smoke/cfms-on-websocket-$version").Path
+        uv sync --project $bundle --locked --no-dev
+        Copy-Item -LiteralPath (Join-Path $bundle "src/config.toml.sample") -Destination (Join-Path $bundle "src/config.toml")
+        uv run --project $bundle --no-dev maintain deployment status --deployment-root $bundle

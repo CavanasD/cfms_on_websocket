@@ -1,73 +1,88 @@
 """
-Main entry point for initializing and testing the CFMS WebSocket application.
-- Checks for the existence of an initialization file ("./init") to determine if the database needs to be set up.
-- If not initialized:
-    - Creates all database tables using SQLAlchemy's metadata.
-    - Creates a default "sysop" user group with "shutdown" permission.
-    - Adds an "admin" user with the "sysop" group.
-    - Writes an "init" file to indicate initialization is complete.
-- After initialization (or if already initialized):
-    - Opens a database session and queries for the user with ID 1.
-    - If the user exists, prints the username and all permissions.
-Modules imported:
-- os: For file existence checks.
-- include.conf_loader.global_config: Loads global configuration.
-- include.database.handler: Provides SQLAlchemy engine, Base, and Session.
-- include.classes.version.Version: Handles versioning.
-- include.database.models: Contains ORM models for User and UserGroup.
-- include.util.user.create_user: Function to create a new user.
-Constants:
-- CORE_VERSION: The current version of the core application.
+Main entry module.
+
+Initializes a fresh database and seeds application data on first startup. Schema
+upgrades for existing databases remain explicit maintenance operations.
 """
 
 import os
 import socket
 import ssl
 import sys
+from collections.abc import Generator
+from contextlib import contextmanager
 
 from loguru import logger
-from websockets.sync.server import serve
+from websockets.sync.server import Server, serve
 
-from include.classes.enum.permissions import Permissions
-from include.classes.misc.guard import LoginGuard
-from include.conf_loader import global_config
-from include.constants import (
+import include.database.models  # noqa: F401
+from include.config.constants import (
     CORE_VERSION,
     DEFAULT_SSL_CERT_VALIDITY_DAYS,
-    ROOT_ABSPATH,
+    FILE_TASK_EVENT_CHANNEL,
+    GLOBAL_BROADCAST_EVENT_CHANNEL,
+    LOGIN_GUARD_EVENT_CHANNEL,
     ROOT_DIRECTORY_ID,
 )
-from include.database.handler import Base, Session, engine
-from include.database.models.entity import Document, DocumentRevision, Folder
-from include.database.models.file import File
-from include.handlers.debugging.throw import RequestThrowExceptionHandler
+from include.config.paths import (
+    EXECUTABLE_ABSPATH,
+    EXTENSION_ROOT,
+)
+from include.config.settings import global_config
+from include.config.validation import get_config_warnings, get_enabled_extensions
+from include.database.initialization import initialize_database_schema
+from include.database.models.documents import (
+    Document,
+    DocumentMetadata,
+    DocumentRevision,
+    Folder,
+)
+from include.database.models.files import File
+from include.database.session import Base, Session, engine
+from include.domains.access.authorization.access_rules import set_access_rules
+from include.domains.access.permissions import Permissions
+from include.domains.drive.homes import ensure_home_parent
+from include.domains.documents.file_task_signals import on_file_task_event
+from include.domains.operations.broadcast import on_global_broadcast
+from include.domains.security.guards.login import LoginGuard
+from include.domains.security.guards.request_rate_control import (
+    validate_handler_rate_limit_costs,
+)
+from include.domains.security.handlers.debugging import RequestThrowExceptionHandler
+from include.extensions.manager import (
+    collect_scheduled_tasks,
+    load_extensions_from_directory,
+    pm,
+)
+from include.providers.bootstrap import initialize_providers
 from include.providers.manager import ProviderManager
-from include.providers.storage import LocalStorageProvider
-from include.router import (
+from include.runtime_lock import RuntimeLockError, server_runtime_lock
+from include.transport.client_address import get_bind_options
+from include.transport.request_entrypoint import global_process_request
+from include.transport.request_handler import validate_request_handler_models
+from include.transport.router import (
     available_functions,
     handle_connection,
     whitelisted_functions,
 )
-from include.system.extmgr import load_extensions_from_directory, pm
-from include.system.listeners import on_global_broadcast
-from include.util.address import is_v6_address
-from include.util.entrance import global_process_request
-from include.util.rule.applying import set_access_rules
+from include.transport.tls import create_server_ssl_context
 
 # fix
-os.makedirs(ROOT_ABSPATH / "content" / "logs", exist_ok=True)
-os.makedirs(ROOT_ABSPATH / "content" / "ssl", exist_ok=True)
+os.makedirs(EXECUTABLE_ABSPATH / "content" / "logs", exist_ok=True)
+os.makedirs(EXECUTABLE_ABSPATH / "content" / "ssl", exist_ok=True)
 
 
 def ensure_root_folder():
     """
-    Ensure the root directory's sentinel Folder record exists in the database.
-    This record carries no children of its own; it exists solely so that
-    access rules (and ObjectAccessEntries) can be attached to the root directory
-    through the normal access-control machinery.
+    Ensure that the sentinel Folder record for the root directory exists in
+    the database.
 
-    On creation the root folder is configured with default access rules that
-    restrict read, write and manage access to the ``sysop`` group only.
+    This record has no children of its own; it exists only so access rules
+    and ObjectAccessEntries can be attached to the root directory through the
+    normal access-control mechanism.
+
+    When created, the root folder is configured with default access rules that
+    restrict read, write, and manage access to the ``sysop`` group only.
     """
     _sysop_rule = {
         "match": "all",
@@ -89,32 +104,53 @@ def ensure_root_folder():
             root = Folder(id=ROOT_DIRECTORY_ID, name="/")
             session.add(root)
             set_access_rules(root, _DEFAULT_ROOT_ACCESS_RULES, inherit_parent=False)
-            session.commit()
+        ensure_home_parent(session)
+        session.commit()
 
 
 def server_init():
     """
-    Initializes the server by checking if the database is already set up.
-    If not, it creates the necessary tables and a default admin user.
-    """
-    if (
-        os.path.exists(ROOT_ABSPATH / "app.db")
-        and global_config["database"]["type"] == "sqlite"
-    ):
-        os.remove(ROOT_ABSPATH / "app.db")
+    Initialize the server by checking whether the database is already set up.
 
-    # Create database tables before inserting data
-    Base.metadata.create_all(engine)
+    If it is not, create the necessary tables and a default admin user.
+    """
+    import datetime
+    import secrets
+
+    from include.domains.identity.commands.groups import create_group
+
+    initialize_database_schema(engine, Base.metadata)
 
     # Ensure the root folder exists before seeding any objects that reference it.
     ensure_root_folder()
-
-    from include.util.group import create_group
 
     create_group(
         group_name="user",
         permissions=[
             {"permission": Permissions.SET_PASSWD},
+            {"permission": Permissions.CREATE_DOCUMENT},
+            {"permission": Permissions.CREATE_DIRECTORY},
+            {"permission": Permissions.DELETE_DOCUMENT},
+            {"permission": Permissions.DELETE_DIRECTORY},
+            {"permission": Permissions.RENAME_DOCUMENT},
+            {"permission": Permissions.RENAME_DIRECTORY},
+            {"permission": Permissions.MOVE},
+            {"permission": Permissions.RESTORE},
+            {"permission": Permissions.PURGE},
+            {"permission": Permissions.LIST_DELETED_ITEMS},
+            {"permission": Permissions.LIST_REVISIONS},
+            {"permission": Permissions.VIEW_REVISION},
+            {"permission": Permissions.SET_CURRENT_REVISION},
+            {"permission": Permissions.DELETE_REVISION},
+            {"permission": Permissions.MANAGE_KEYRINGS},
+            {"permission": Permissions.MANAGE_2FA},
+            {"permission": Permissions.GET_USER_INFO},
+            {"permission": Permissions.RENAME_USER},
+            {"permission": Permissions.SET_USER_AVATAR},
+            {"permission": Permissions.SET_ACCESS_RULES},
+            {"permission": Permissions.VIEW_ACCESS_RULES},
+            {"permission": Permissions.MANAGE_ACCESS},
+            {"permission": Permissions.SEARCH},
         ],
     )
     create_group(
@@ -132,16 +168,22 @@ def server_init():
             {"permission": Permissions.DELETE_DIRECTORY},
             {"permission": Permissions.RENAME_DIRECTORY},
             {"permission": Permissions.MANAGE_SYSTEM},
+            {"permission": Permissions.DIAGNOSTICS},
+            {"permission": Permissions.VIEW_SCHEDULES},
+            {"permission": Permissions.MANAGE_SCHEDULES},
             {"permission": Permissions.CREATE_USER},
             {"permission": Permissions.DELETE_USER},
             {"permission": Permissions.RENAME_USER},
             {"permission": Permissions.MANAGE_USER_STATUS},
             {"permission": Permissions.GET_USER_INFO},
+            {"permission": Permissions.SET_USER_PERMISSIONS},
             {"permission": Permissions.GET_GROUP_INFO},
             {"permission": Permissions.CHANGE_USER_GROUPS},
             {"permission": Permissions.SUPER_SET_PASSWD},
             {"permission": Permissions.VIEW_ACCESS_RULES},
             {"permission": Permissions.SET_ACCESS_RULES},
+            {"permission": Permissions.VIEW_METADATA},
+            {"permission": Permissions.SET_METADATA_TAGS},
             {"permission": Permissions.LIST_USERS},
             {"permission": Permissions.LIST_GROUPS},
             {"permission": Permissions.CREATE_GROUP},
@@ -149,6 +191,9 @@ def server_init():
             {"permission": Permissions.RENAME_GROUP},
             {"permission": Permissions.SET_GROUP_PERMISSIONS},
             {"permission": Permissions.BYPASS_LOCKDOWN},
+            {"permission": Permissions.BYPASS_DOCUMENT_CREATION_RATE_LIMIT},
+            {"permission": Permissions.BYPASS_DOCUMENT_DOWNLOAD_RATE_LIMIT},
+            {"permission": Permissions.BYPASS_REQUEST_RATE_LIMIT},
             {"permission": Permissions.APPLY_LOCKDOWN},
             {"permission": Permissions.VIEW_AUDIT_LOGS},
             {"permission": Permissions.MANAGE_ACCESS},
@@ -164,30 +209,54 @@ def server_init():
             {"permission": Permissions.DELETE_REVISION},
             {"permission": Permissions.MANAGE_KEYRINGS},
             {"permission": Permissions.LIST_USER_BLOCKS},
+            {"permission": Permissions.LIST_BANNED_SUBNETS},
+            {"permission": Permissions.MANAGE_BANNED_SUBNETS},
+            {"permission": Permissions.LIST_AUTH_LOCKOUTS},
+            {"permission": Permissions.UNLOCK_AUTH_LOCKOUTS},
             {"permission": Permissions.PURGE},
             {"permission": Permissions.RESTORE},
             {"permission": Permissions.LIST_DELETED_ITEMS},
+            {"permission": Permissions.SUPER_RENAME_USER},
+            {"permission": Permissions.SET_USER_AVATAR},
         ],
     )
 
-    # Initialize providers
+    # Initialize providers, since we need to use the storage provider later.
     initialize_providers()
 
-    # Add sample file and document
-    sample_file_path = "content/hello"
+    # Read from sample document source and write back to storage.
+    # This is necessary because the storage provider cannot be determined in advance.
+    sample_source_path = EXECUTABLE_ABSPATH / "content" / "hello"
 
-    with open(sample_file_path, "rb") as source:
-        with ProviderManager().storage.fopen(sample_file_path, "wb") as f:
-            f.write(source.read())
+    today = datetime.datetime.now(datetime.UTC).date()
+    real_filename = secrets.token_hex(32)
+    sample_target_path = f"content/files/{today.year}/{today.month}/{real_filename}"
+
+    # Ensure the directory structure exists before writing the file
+    ProviderManager().storage.makedirs(
+        os.path.dirname(sample_target_path), exist_ok=True
+    )
+
+    with (
+        open(sample_source_path, "rb") as source,
+        ProviderManager().storage.fopen(sample_target_path, "wb") as f,
+    ):
+        f.write(source.read())
 
     with Session() as session:
         # not using `ROOT_ABSPATH` here to allow easy migration
-        init_file = File(id="init", path=sample_file_path, active=True)
+        init_file = File(
+            id="init",
+            path=sample_target_path,
+            size=os.path.getsize(sample_source_path),
+            active=True,
+        )
         session.add(init_file)
 
         init_document = Document(
             id="hello", title="Hello World", folder_id=ROOT_DIRECTORY_ID
         )
+        init_document.metadata_record = DocumentMetadata()
         init_document_revision = DocumentRevision(file_id=init_file.id)
         init_document.revisions.append(init_document_revision)
         init_document.current_revision = init_document_revision
@@ -198,7 +267,7 @@ def server_init():
     import secrets
     import string
 
-    from include.util.user import create_user
+    from include.domains.identity.commands.users import create_user
 
     alphabet = string.ascii_letters + string.digits + "!@#$%^&*()-_=+[]{};:,.<>?/"
     password = "".join(secrets.choice(alphabet) for _ in range(16))
@@ -214,19 +283,20 @@ def server_init():
                 "start_time": 0,
                 "end_time": None,
             },
-            {
-                "group_name": "user",
-                "start_time": 0,
-                "end_time": None,
-            },
+            {"group_name": "user", "start_time": 0, "end_time": None},
         ],
     )
 
-    # 将密码输出到根目录下的 admin_password.txt 文件
-    with open(ROOT_ABSPATH / "admin_password.txt", "w", encoding="utf-8") as pwd_file:
+    # Write the generated password to admin_password.txt in the project root.
+    with open(
+        EXECUTABLE_ABSPATH / "admin_password.txt", "w", encoding="utf-8"
+    ) as pwd_file:
         pwd_file.write(f"{password}\n")
 
-    os.makedirs(ROOT_ABSPATH / "content", exist_ok=True)
+    # Logs, certificates, and private keys are all stored on the server's file system;
+    # therefore, the `os` library is used for read/write operations instead of
+    # `StorageProvider`.
+    os.makedirs(EXECUTABLE_ABSPATH / "content", exist_ok=True)
 
     import datetime
 
@@ -239,12 +309,12 @@ def server_init():
     cert_path = global_config["server"]["ssl_certfile"]
     key_path = global_config["server"]["ssl_keyfile"]
 
-    # 使用python包 cryptography 生成自签名证书和私钥
+    # Generate a self-signed certificate and private key with cryptography.
     if not (os.path.exists(cert_path) and os.path.exists(key_path)):
-        # 生成 ECC 私钥
+        # Generate the ECC private key.
         private_key = ec.generate_private_key(ec.SECP256R1(), default_backend())
 
-        # 生成自签名证书
+        # Generate the self-signed certificate.
         subject = issuer = x509.Name(
             [
                 x509.NameAttribute(
@@ -258,9 +328,9 @@ def server_init():
             .issuer_name(issuer)
             .public_key(private_key.public_key())
             .serial_number(x509.random_serial_number())
-            .not_valid_before(datetime.datetime.now(datetime.timezone.utc))
+            .not_valid_before(datetime.datetime.now(datetime.UTC))
             .not_valid_after(
-                datetime.datetime.now(datetime.timezone.utc)
+                datetime.datetime.now(datetime.UTC)
                 + datetime.timedelta(days=DEFAULT_SSL_CERT_VALIDITY_DAYS)
             )
             .add_extension(
@@ -272,7 +342,7 @@ def server_init():
             .sign(private_key, hashes.SHA256(), default_backend())
         )
 
-        # 写入私钥
+        # Write the private key.
         with open(key_path, "wb") as f:
             f.write(
                 private_key.private_bytes(
@@ -282,95 +352,17 @@ def server_init():
                 )
             )
 
-        # 写入证书
+        # Write the certificate.
         with open(cert_path, "wb") as f:
             f.write(cert.public_bytes(serialization.Encoding.PEM))
 
-    with open(ROOT_ABSPATH / "init", "w") as f:
+    with open(EXECUTABLE_ABSPATH / "init", "w") as f:
         f.write("This file indicates that the database has been initialized.\n")
-
-
-def initialize_providers():
-    """
-    Initializes and registers the necessary providers for the application.
-
-    This function creates instances of the required providers (e.g., storage,
-    caching, event bus) and registers them with the ProviderManager for later
-    use throughout the application.
-    """
-
-    # Initialize and register storage provider
-    match global_config["provider"]["storage"]:
-        case "local":
-            storage_provider = LocalStorageProvider()
-        case "s3":
-            from include.providers.storage.s3 import S3StorageProvider
-
-            s3_cfg = global_config["s3"]
-            storage_provider = S3StorageProvider(
-                bucket_name=s3_cfg["bucket"],
-                endpoint_url=s3_cfg["endpoint_url"],
-                aws_access_key_id=s3_cfg["access_key_id"],
-                aws_secret_access_key=s3_cfg["secret_access_key"],
-                region_name=s3_cfg["region_name"],
-            )
-        case _:
-            raise ValueError(
-                f"Unsupported storage provider type: {global_config['provider']['storage']}"
-            )
-
-    ProviderManager().register(storage_provider)
-
-    # Initialize and register caching provider
-    match global_config["provider"]["caching"]:
-        case "memory":
-            from include.providers.caching import MemoryCachingProvider
-
-            caching_provider = MemoryCachingProvider()
-        case "redis":
-            from include.providers.caching import RedisCachingProvider
-
-            redis_cfg = global_config["redis"]
-            caching_provider = RedisCachingProvider(
-                host=redis_cfg["host"],
-                port=redis_cfg["port"],
-                password=redis_cfg.get("password", ""),
-                db=redis_cfg.get("db", 0),
-            )
-        case _:
-            raise ValueError(
-                f"Unsupported caching provider type: {global_config['caching']['type']}"
-            )
-
-    ProviderManager().register(caching_provider)
-
-    # Initialize and register event bus provider
-    match global_config["provider"]["event_bus"]:
-        case "local":
-            from include.providers.events import LocalEventBusProvider
-
-            event_bus_provider = LocalEventBusProvider()
-        case "redis":
-            from include.providers.events import RedisEventBusProvider
-
-            redis_cfg = global_config["redis"]
-            event_bus_provider = RedisEventBusProvider(
-                host=redis_cfg["host"],
-                port=redis_cfg["port"],
-                password=redis_cfg.get("password", ""),
-                db=redis_cfg.get("db", 0),
-            )
-        case _:
-            raise ValueError(
-                f"Unsupported event bus provider type: {global_config['event_bus']['type']}"
-            )
-
-    ProviderManager().register(event_bus_provider)
 
 
 def prepare_handlers():
     """
-    Prepares the available request handlers by loading built-in handlers and
+    Prepare the available request handlers by loading built-in handlers and
     extension handlers.
 
     This function populates the `available_functions` dictionary with handlers
@@ -379,13 +371,14 @@ def prepare_handlers():
     It also populates the `whitelisted_functions` list with actions that are
     allowed even during lockdown.
     """
-
-    # Debugging
-    if global_config["debug"]:
+    if global_config["debug"]:  # Debugging
         available_functions["throw_exception"] = RequestThrowExceptionHandler
 
     # Load available request handlers from extensions
     extension_handlers = pm.hook.ext_register_handlers()
+
+    # If multiple extensions attempt to register the same action, the behavior is
+    # undefined.
     for handler_dict in extension_handlers:
         available_functions.update(handler_dict)
 
@@ -395,22 +388,29 @@ def prepare_handlers():
             if handler_name in available_functions:
                 del available_functions[handler_name]
 
+    validate_request_handler_models(available_functions)
+
     for ext_whitelisted_actions in pm.hook.ext_register_whitelisted_actions():
         whitelisted_functions.extend(ext_whitelisted_actions)
+
+    for action in validate_handler_rate_limit_costs(available_functions):
+        logger.warning(
+            f"Configured request rate-limit cost references unknown action {action!r}"
+        )
 
 
 def prepare_logger():
     """
-    Prepares the logger using loguru with both console and file handlers.
+    Prepare the logger using Loguru with both console and file handlers.
 
     The console handler outputs colored logs at INFO level, while the file
-    handler writes detailed logs at DEBUG level with automatic rotation
-    and compression.
+    handler writes detailed logs at DEBUG level with automatic rotation and
+    compression.
 
     The log file is located at "./content/logs/server.log".
     """
 
-    log_file = ROOT_ABSPATH / "content" / "logs" / "server.log"
+    log_file = EXECUTABLE_ABSPATH / "content" / "logs" / "server.log"
     fmt = "[<green>{time:YYYY-MM-DD HH:mm:ss,SSS}</green> <level>{level: <8}</level>] <level>{message}</level>"
 
     # reset default logger to avoid conflicts with loguru's configuration
@@ -433,53 +433,48 @@ def prepare_logger():
     )
 
 
-def main():
+@contextmanager
+def _server_lifecycle(server: Server) -> Generator[None]:
+    try:
+        pm.hook.ext_on_startup(server=server)
+        ProviderManager().scheduling.start(collect_scheduled_tasks())
+        yield
+    finally:
+        try:
+            ProviderManager().scheduling.shutdown()
+        finally:
+            pm.hook.ext_on_shutdown()
+
+
+def _run_server():
     prepare_logger()
 
-    if not os.path.exists(ROOT_ABSPATH / "init"):
+    if not os.path.exists(EXECUTABLE_ABSPATH / "init"):
         logger.info("Database not initialized, initializing now...")
         server_init()
 
     logger.info("Initializating CFMS WebSocket server...")
     logger.info(f"CFMS Core Version: {CORE_VERSION}")
-    ssl_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-    ssl_context.load_cert_chain(
-        certfile=global_config["server"]["ssl_certfile"],
-        keyfile=global_config["server"]["ssl_keyfile"],
-    )
-    ssl_context.minimum_version = ssl.TLSVersion.TLSv1_3
 
-    # Mutual TLS: require and verify client certificates if configured
+    # TODO: Add support for TLS ECH when upstream libraries support it.
     security_cfg = global_config.get("security", {})
-    if security_cfg.get("require_client_cert", False):
-        client_ca_path: str = security_cfg["client_cert_ca_path"]
-        if not os.path.exists(client_ca_path) or not os.path.isdir(client_ca_path):
-            logger.error(
-                "Client certificate CA path not found or is not a dir: "
-                f"{client_ca_path}. Cannot enable client certificate "
-                "verification. Please provide a valid CA certificate "
-                "path or disable 'require_client_cert' in the configuration."
-            )
-            raise SystemExit(1)
-        ssl_context.verify_mode = ssl.CERT_REQUIRED
-
-        ssl_context.verify_flags |= ssl.VERIFY_X509_STRICT
-        # ssl_context.verify_flags |= ssl.VERIFY_CRL_CHECK_LEAF
-        # ssl_context.verify_flags |= ssl.VERIFY_CRL_CHECK_CHAIN
-
-        ssl_context.load_verify_locations(capath=client_ca_path)
+    require_client_cert = security_cfg.get("require_client_cert", False)
+    ssl_context = create_server_ssl_context(
+        global_config["server"]["ssl_certfile"],
+        global_config["server"]["ssl_keyfile"],
+        require_client_cert=require_client_cert,
+        client_ca_path=(
+            security_cfg["client_cert_ca_path"] if require_client_cert else None
+        ),
+    )
+    if require_client_cert:
         logger.info(
             f"Mutual TLS enabled: client certificates will be verified "
-            f"against CA path '{client_ca_path}'."
+            f"against CA path '{security_cfg['client_cert_ca_path']}'."
         )
 
-    if not security_cfg["pepper"]:
-        logger.warning(
-            "Setting the value for `pepper` to empty in the configuration "
-            "file can lead to potential security vulnerabilities. For "
-            "details, see: https://cheatsheetseries.owasp.org/cheatsheets/"
-            "Password_Storage_Cheat_Sheet.html#peppering"
-        )
+    for warning in get_config_warnings(global_config):
+        logger.warning(warning)
 
     if ssl.OPENSSL_VERSION_INFO < (3, 5):
         logger.warning(
@@ -491,20 +486,26 @@ def main():
             "OpenSSL 3.5 or later to resolve this issue."
         )
 
-    # Always create tables that do not exist
-    Base.metadata.create_all(engine)
-
     # Ensure the root folder record exists (handles upgrades from older versions)
     ensure_root_folder()
 
-    # Initialize Providers
     initialize_providers()
 
     # Register global broadcast handler
-    ProviderManager().event_bus.subscribe("system:broadcast", on_global_broadcast)
+    ProviderManager().event_bus.subscribe(
+        GLOBAL_BROADCAST_EVENT_CHANNEL, on_global_broadcast
+    )
+    ProviderManager().event_bus.subscribe(
+        LOGIN_GUARD_EVENT_CHANNEL, LoginGuard.handle_event
+    )
+    ProviderManager().event_bus.subscribe(FILE_TASK_EVENT_CHANNEL, on_file_task_event)
 
-    # Register plugins after database initialization
-    load_extensions_from_directory(ROOT_ABSPATH / "include" / "extensions")
+    # Register extensions after database initialization
+    load_extensions_from_directory(
+        EXTENSION_ROOT,
+        get_enabled_extensions(global_config),
+        config=global_config,
+    )
 
     # Initialize available request handlers
     prepare_handlers()
@@ -512,24 +513,46 @@ def main():
     # Preload banned subnet list into memory for LoginGuard
     LoginGuard.reload_networks()
 
-    # DO NOT MODIFY socket family setting unless you know what you are doing
-    socket_family = socket.AF_INET6
-
     host = global_config["server"]["host"]
     port = global_config["server"]["port"]
-    host_address = f"[{host}]" if is_v6_address(host) else host
+    socket_family, dualstack_ipv6 = get_bind_options(
+        host, global_config["server"]["dualstack_ipv6"]
+    )
 
-    with serve(
-        handle_connection,
-        host,
-        port,
-        ssl=ssl_context,
-        family=socket_family,
-        dualstack_ipv6=global_config["server"]["dualstack_ipv6"],
-        process_request=global_process_request,
-    ) as server:
-        logger.info(f"CFMS WebSocket server started at wss://{host_address}:{port}")
-        server.serve_forever()
+    try:
+        with serve(
+            handle_connection,
+            host,
+            port,
+            ssl=ssl_context,
+            family=socket_family,
+            dualstack_ipv6=dualstack_ipv6,
+            process_request=global_process_request,
+        ) as server:
+            bound_address = server.socket.getsockname()
+            bound_host = bound_address[0]
+            display_host = (
+                f"[{bound_host}]"
+                if server.socket.family == socket.AF_INET6
+                else bound_host
+            )
+            with _server_lifecycle(server):
+                logger.info(
+                    "CFMS WebSocket server started at "
+                    f"wss://{display_host}:{bound_address[1]}"
+                )
+                server.serve_forever()
+    finally:
+        global_config.stop()
+
+
+def main():
+    try:
+        with server_runtime_lock(EXECUTABLE_ABSPATH):
+            _run_server()
+    except RuntimeLockError as exc:
+        logger.error(str(exc))
+        raise SystemExit(1) from exc
 
 
 if __name__ == "__main__":

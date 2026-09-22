@@ -1,0 +1,366 @@
+"""
+Two-Factor Authentication (TOTP) handlers for CFMS.
+
+This module provides handlers for setting up, validating, and canceling
+two-factor authentication using Time-based One-Time Passwords (TOTP).
+"""
+
+from operator import xor
+from typing import Literal, Self
+
+import orjson
+from pydantic import model_validator
+
+from include.database.models.identity import User, UserStatus
+from include.database.session import Session
+from include.domains.access.permissions import Permissions
+from include.domains.identity.types import RequestUsername
+from include.domains.security.guards.login import (
+    AuthFactor,
+    LoginGuard,
+    ThrottleDecision,
+)
+from include.domains.security.types import TwoFactorToken
+from include.transport.client_address import get_client_ip
+from include.transport.connection import ConnectionHandler
+from include.transport.request_handler import (
+    REQUEST_UNSET,
+    EmptyRequestDataModel,
+    Omittable,
+    RequestDataModel,
+    RequestHandler,
+    Result,
+)
+from include.types import NonEmptyString
+
+
+class _Setup2FARequest(RequestDataModel):
+    method: Omittable[Literal["totp"]] = REQUEST_UNSET
+
+
+class _Validate2FARequest(RequestDataModel):
+    token: TwoFactorToken
+
+
+class _Disable2FARequest(RequestDataModel):
+    username: Omittable[RequestUsername] = REQUEST_UNSET
+    password: Omittable[NonEmptyString] = REQUEST_UNSET
+
+    @model_validator(mode="after")
+    def require_username_or_password(self) -> Self:
+        if not {"username", "password"} & self.model_fields_set:
+            raise ValueError("username or password is required")
+        return self
+
+
+class _Get2FAStatusRequest(RequestDataModel):
+    target: Omittable[NonEmptyString] = REQUEST_UNSET
+
+
+def _conclude_throttled(
+    handler: ConnectionHandler,
+    decision: ThrottleDecision,
+    target: str,
+    username: str | None = None,
+) -> Result:
+    data = {}
+    if decision.retry_after_seconds is not None:
+        data["retry_after_seconds"] = decision.retry_after_seconds
+    handler.conclude_request(
+        429,
+        data,
+        "Too many authentication attempts. Please try again later.",
+    )
+    return Result(code=429, target=target, username=username)
+
+
+class RequestSetup2FAHandler(RequestHandler):
+    """
+    Handler for setting up two-factor authentication.
+
+    This handler generates a TOTP secret and backup codes for the user.
+    The TOTP secret is returned as a provisioning URI that can be used
+    to generate a QR code for scanning with authenticator apps.
+
+    Response Data:
+        - secret: The TOTP secret (for manual entry)
+        - provisioning_uri: URI for QR code generation
+        - backup_codes: List of backup codes for account recovery
+    """
+
+    request_model = _Setup2FARequest
+
+    require_auth = True
+    rate_limit_cost = 20
+
+    def handle(self, handler: ConnectionHandler):
+        with Session() as session:
+            user = User.get_existing(session, handler.username)
+
+            # Check if user already has 2FA enabled
+            if user.totp_enabled:
+                handler.conclude_request(
+                    code=400,
+                    message="Two-factor authentication is already enabled. Please cancel it first.",
+                    data={
+                        "method": "totp"
+                    },  # will be extended if other methods are added
+                )
+                return
+
+            # Setup TOTP
+            secret, backup_codes = user.setup_totp()
+
+            handler.conclude_request(
+                code=200,
+                message="Two-factor authentication setup initiated. Please verify with your authenticator app.",
+                data={
+                    "secret": secret,
+                    "provisioning_uri": user.totp_provisioning_uri,
+                    "backup_codes": backup_codes,
+                },
+            )
+            return Result(code=200, target=handler.username)
+
+
+class RequestValidate2FAHandler(RequestHandler):
+    """
+    Handler for validating and enabling two-factor authentication.
+
+    After setup, the user must validate their TOTP configuration by
+    providing a valid code from their authenticator app. This enables 2FA.
+    """
+
+    request_model = _Validate2FARequest
+
+    require_auth = True
+    rate_limit_cost = 2
+
+    def handle(self, handler: ConnectionHandler):
+        token = handler.data["token"]
+        username = handler.username
+
+        success = False
+
+        with Session() as session:
+            user = session.get(User, username)
+
+            if user is None:
+                handler.conclude_request(
+                    code=404,
+                    message="User not found",
+                    data={},
+                )
+                return
+
+            # Check if TOTP secret exists but not enabled yet
+            if not user.totp_secret:
+                handler.conclude_request(
+                    code=400,
+                    message="Two-factor authentication has not been set up. Please set it up first.",
+                    data={},
+                )
+                return
+
+            if user.totp_enabled:
+                handler.conclude_request(
+                    code=400,
+                    message="Two-factor authentication is already enabled.",
+                    data={"method": "totp"},
+                )
+                return
+
+            # Verify the provided TOTP token
+            if user.verify_totp(token):
+                user.enable_totp()
+                success = True
+
+        if success:
+            handler.conclude_request(
+                code=200,
+                message="Two-factor authentication enabled successfully",
+                data={"method": "totp"},
+            )
+        else:
+            handler.conclude_request(401, {}, "Invalid verification code")
+
+        return Result(code=0 if success else 401, target=username)
+
+
+class RequestDisable2FAHandler(RequestHandler):
+    """
+    Handler for canceling two-factor authentication.
+
+    This handler disables and removes TOTP configuration for the user.
+    The user must provide their password for verification.
+    """
+
+    request_model = _Disable2FARequest
+
+    require_auth = True
+    rate_limit_cost = 5
+
+    def handle(self, handler: ConnectionHandler):
+        password = handler.data.get("password")
+        target_username = handler.data.get("username") or handler.username
+        requester_username = handler.username
+
+        is_self = target_username == requester_username
+        has_password = bool(password)
+
+        if xor(is_self, has_password):
+            error_msg = (
+                "Password is required when disabling your own 2FA"
+                if is_self
+                else "Password should not be provided when disabling 2FA for another user"
+            )
+            handler.conclude_request(400, {}, error_msg)
+            return Result(code=400, target=target_username, username=requester_username)
+
+        ip = get_client_ip(handler.stream.connection._ws)
+        if password:
+            decision = LoginGuard.evaluate(ip, target_username, AuthFactor.PASSWORD)
+            if not decision.allowed:
+                return _conclude_throttled(
+                    handler, decision, target_username, requester_username
+                )
+
+        with Session() as session:
+            if not is_self:
+                requester = User.get_existing(session, requester_username)
+                if Permissions.MANAGE_2FA not in requester.all_permissions:
+                    handler.conclude_request(403, {}, "Permission denied")
+                    return Result(
+                        code=403,
+                        target=target_username,
+                        username=requester_username,
+                    )
+
+            user = session.get(User, target_username)
+            if not user or not user.totp_enabled:
+                handler.conclude_request(400, {}, "2FA not enabled or user not found")
+                return Result(
+                    code=400, target=target_username, username=requester_username
+                )
+
+            if password:
+                if not user.verify_password(password):
+                    LoginGuard.report_failure(ip, target_username, AuthFactor.PASSWORD)
+                    handler.conclude_request(401, {}, "Invalid password")
+                    return Result(
+                        code=401, target=target_username, username=requester_username
+                    )
+
+                LoginGuard.report_success(
+                    ip,
+                    target_username,
+                    AuthFactor.PASSWORD,
+                    completed_authentication=True,
+                )
+
+                if user.status != UserStatus.ACTIVE:
+                    handler.conclude_request(4003, {}, "User account is not active")
+                    return Result(
+                        code=4003, target=target_username, username=requester_username
+                    )
+
+            user.disable_totp()
+
+        handler.conclude_request(200, {}, "2FA disabled successfully")
+        return Result(code=0, target=target_username, username=requester_username)
+
+
+class RequestCancel2FASetupHandler(RequestHandler):
+    """
+    Handler for canceling two-factor authentication setup.
+
+    This handler removes the TOTP configuration that was set up
+    but not yet validated/enabled.
+    """
+
+    request_model = EmptyRequestDataModel
+
+    require_auth = True
+    rate_limit_cost = 1
+
+    def handle(self, handler: ConnectionHandler):
+        with Session() as session:
+            user = User.get_existing(session, handler.username)
+
+            # Check if TOTP setup exists but not enabled yet
+            if not user.totp_secret or user.totp_enabled:
+                handler.conclude_request(
+                    code=400,
+                    message="No pending two-factor authentication setup to cancel.",
+                    data={},
+                )
+                return
+
+            # Cancel TOTP setup
+            user.totp_secret = None
+            user.totp_backup_codes = None
+
+            session.add(user)
+            session.commit()
+
+            handler.conclude_request(
+                code=200,
+                message="Two-factor authentication setup canceled successfully",
+                data={},
+            )
+
+
+class RequestGet2FAStatusHandler(RequestHandler):
+    """
+    Handler for getting two-factor authentication status.
+
+    Returns whether 2FA is enabled for the authenticated user.
+    """
+
+    request_model = _Get2FAStatusRequest
+
+    require_auth = True
+    rate_limit_cost = 1
+
+    def handle(self, handler: ConnectionHandler):
+
+        target_username = handler.data.get("target") or handler.username
+
+        with Session() as session:
+            user = User.get_existing(session, handler.username)
+
+            if (
+                target_username != handler.username
+                and Permissions.MANAGE_2FA not in user.all_permissions
+            ):
+                handler.conclude_request(
+                    code=403,
+                    message="Forbidden: Cannot access another user's two-factor authentication status",
+                    data={},
+                )
+                return Result(
+                    code=403, target=target_username, username=handler.username
+                )
+
+            target = session.get(User, target_username)
+            if not target:
+                handler.conclude_request(
+                    code=404,
+                    message="Target user not found",
+                    data={},
+                )
+                return
+
+            handler.conclude_request(
+                code=200,
+                message="Two-factor authentication status",
+                data={
+                    "enabled": target.totp_enabled,
+                    "method": "totp" if target.totp_enabled else None,
+                    "backup_codes_count": (
+                        len(orjson.loads(target.totp_backup_codes))
+                        if target.totp_backup_codes
+                        else 0
+                    ),
+                },
+            )

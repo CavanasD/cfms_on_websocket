@@ -1,0 +1,1254 @@
+__all__ = [
+    "RequestCreateDocumentHandler",
+    "RequestDeleteDocumentHandler",
+    "RequestDownloadFileHandler",
+    "RequestGetDocumentHandler",
+    "RequestGetDocumentInfoHandler",
+    "RequestMoveDocumentHandler",
+    "RequestRenameDocumentHandler",
+    "RequestSetDocumentRulesHandler",
+    "RequestSetDocumentTagsHandler",
+    "RequestUploadDocumentHandler",
+    "RequestUploadFileHandler",
+]
+
+import datetime
+import secrets
+import time
+from typing import Annotated, Any
+
+import jsonschema
+from pydantic import ConfigDict, Field, StringConstraints
+from sqlalchemy.orm import Session as ORMSession
+
+from include.config.constants import (
+    DOWNLOAD_TRANSFER_MAX_CHUNK_SIZE,
+    DOWNLOAD_TRANSFER_MIN_CHUNK_SIZE,
+    FILE_TASK_DEFAULT_DURATION_SECONDS,
+    ROOT_DIRECTORY_ID,
+    UPLOAD_TRANSFER_MIN_CHUNK_SIZE,
+)
+from include.config.validation import DocumentUploadPolicy
+from include.database.clock import database_now
+from include.config.settings import global_config
+from include.database.models.documents import (
+    Document,
+    DocumentMetadata,
+    DocumentMetadataTag,
+    DocumentRevision,
+    EntityStatus,
+    Folder,
+)
+from include.database.models.files import File, FileTask, FileTaskStatus, TransferMode
+from include.database.models.identity import User
+from include.database.session import Session
+from include.domains.access.authorization.access_rules import apply_access_rules
+from include.domains.access.authorization.compiled_rules import (
+    get_access_rules_dict,
+    get_access_rules_list,
+)
+from include.domains.access.authorization.evaluation import check_access_requirements
+from include.domains.access.permissions import Permissions
+from include.domains.documents.commands.file_tasks import (
+    cancel_file_tasks_for_files,
+    expire_file_task_if_due,
+    serialize_file_task,
+)
+from include.domains.documents.commands.name_conflicts import (
+    NodeNameConflictError,
+    describe_node_name_conflict,
+    get_target_folder_and_check_write,
+    node_name_mutation,
+)
+from include.domains.documents.commands.revision_deletion import (
+    delete_all_document_revisions,
+)
+from include.domains.documents.commands.upload_cleanup import (
+    try_reclaim_abandoned_uploads,
+)
+from include.domains.documents.creation_limits import check_document_creation_limits
+from include.domains.documents.download_limits import check_download_issue_limits
+from include.domains.documents.file_task_signals import publish_cancelled_file_tasks
+from include.domains.documents.handlers.name_conflict_responses import (
+    respond_to_node_name_conflict,
+)
+from include.domains.documents.queries.file_references import (
+    find_unreachable_document_file_ids,
+)
+from include.domains.documents.queries.listing import (
+    fetch_latest_active_revisions_by_document,
+)
+from include.domains.documents.types import RevisionID
+from include.domains.security.guards.rate_limits import risk_control_transaction
+from include.exceptions.misc import NoActiveRevisionsError
+from include.messages import Messages as smsg
+from include.transport.connection import ConnectionHandler
+from include.transport.request_handler import (
+    REQUEST_UNSET,
+    Omittable,
+    RequestDataModel,
+    RequestHandler,
+    Result,
+)
+from include.types import JsonInteger, NonEmptyString
+
+_Sha256 = Annotated[str, StringConstraints(pattern="^[0-9A-Fa-f]{64}$")]
+_Tag = Annotated[str, StringConstraints(min_length=1, max_length=255)]
+
+# FIXME: Extract to `include.types` when necessary.
+_NonNegativeInteger = Annotated[JsonInteger, Field(ge=0)]
+
+
+class _DocumentInfoRequest(RequestDataModel):
+    model_config = ConfigDict(
+        strict=True,
+        validate_default=True,
+        extra="allow",
+    )
+
+    document_id: NonEmptyString
+
+
+class _DocumentIDRequest(RequestDataModel):
+    document_id: NonEmptyString
+
+
+class _CreateDocumentRequest(RequestDataModel):
+    folder_id: str | None = None
+    title: NonEmptyString
+    access_rules: Omittable[dict[str, Any]] = REQUEST_UNSET
+    inherit_parent: Omittable[bool] = REQUEST_UNSET
+
+
+class _UploadDocumentRequest(RequestDataModel):
+    document_id: NonEmptyString
+    parent_revision_id: RevisionID | None = None
+
+
+class _RenameDocumentRequest(RequestDataModel):
+    document_id: NonEmptyString
+    new_title: NonEmptyString
+
+
+class _DownloadFileRequest(RequestDataModel):
+    task_id: NonEmptyString
+    offset: Omittable[_NonNegativeInteger] = REQUEST_UNSET
+    max_chunk_size: Annotated[
+        JsonInteger,
+        Field(
+            ge=DOWNLOAD_TRANSFER_MIN_CHUNK_SIZE,
+            le=DOWNLOAD_TRANSFER_MAX_CHUNK_SIZE,
+        ),
+    ]
+
+
+class _UploadFileRequest(RequestDataModel):
+    task_id: NonEmptyString
+    file_size: _NonNegativeInteger
+    sha256: _Sha256 | None
+    max_chunk_size: Annotated[JsonInteger, Field(ge=UPLOAD_TRANSFER_MIN_CHUNK_SIZE)]
+    restart: Omittable[bool] = REQUEST_UNSET
+
+
+class _SetDocumentRulesRequest(RequestDataModel):
+    document_id: NonEmptyString
+    access_rules: dict[str, list[Any]]
+    inherit_parent: Omittable[bool] = REQUEST_UNSET
+
+
+class _MoveDocumentRequest(RequestDataModel):
+    document_id: NonEmptyString
+    target_folder_id: str | None = None
+
+
+class _RestoreDocumentRequest(RequestDataModel):
+    document_id: NonEmptyString
+    target_folder_id: str | None = None
+    new_title: Omittable[NonEmptyString] = REQUEST_UNSET
+
+
+class _SetDocumentTagsRequest(RequestDataModel):
+    document_id: NonEmptyString
+    tags: Annotated[list[_Tag], Field(max_length=128)]
+
+
+def create_file_task(
+    session: ORMSession,
+    file: File,
+    transfer_mode: TransferMode = TransferMode.DOWNLOAD,
+    *,
+    issued_by_username: str | None = None,
+) -> dict[str, Any]:
+    """Creates a new file processing task for the specified file.
+
+    Args:
+        session: Transaction that owns the file and the new task.
+        file (File): The file object for which the task is to be generated.
+
+    Returns:
+        dict or None: A dictionary containing the task details:
+            - task_id (int): The unique identifier of the created task.
+            - provider (str): The file transfer provider (e.g., "native").
+            - start_time (float): The start time of the task.
+            - end_time (float): The end time of the task (1 hour after start).
+        Returns None if the file with the given file_id does not exist.
+
+    """
+    if not file:
+        raise ValueError("File can not be None when creating a file task")
+
+    now = database_now(session)
+    duration = (
+        DocumentUploadPolicy.from_config().start_timeout_seconds
+        if transfer_mode == TransferMode.UPLOAD
+        else FILE_TASK_DEFAULT_DURATION_SECONDS
+    )
+    task = FileTask(
+        file_id=file.id,
+        status=FileTaskStatus.PENDING,
+        mode=transfer_mode,
+        start_time=now,
+        end_time=now + duration,
+        issued_by_username=issued_by_username,
+    )
+    session.add(task)
+    session.flush()
+
+    return serialize_file_task(task)
+
+
+def get_or_create_document_metadata(document: Document) -> DocumentMetadata:
+    if document.metadata_record is None:
+        document.metadata_record = DocumentMetadata()
+    return document.metadata_record
+
+
+def mark_document_modified(document: Document, username: str) -> None:
+    get_or_create_document_metadata(document).last_modified_by_username = username
+
+
+def serialize_document_metadata(document: Document) -> dict:
+    metadata = document.metadata_record
+    if metadata is None:
+        return {
+            "tags": [],
+            "creator": None,
+            "last_modified_by": None,
+        }
+
+    return {
+        "tags": [tag.tag for tag in metadata.tags],
+        "creator": metadata.creator_username,
+        "last_modified_by": metadata.last_modified_by_username,
+    }
+
+
+class RequestGetDocumentInfoHandler(RequestHandler):
+    """Handles the "get_document_info" action."""
+
+    request_model = _DocumentInfoRequest
+
+    require_auth = True
+    rate_limit_cost = 3
+
+    def handle(self, handler: ConnectionHandler):
+
+        document_id = handler.data.get("document_id")
+
+        if not document_id:
+            handler.conclude_request(400, {}, smsg.DOCUMENT_ID_REQUIRED)
+            return
+
+        with Session() as session:
+            user = User.get_existing(session, handler.username)
+
+            document = session.get(Document, document_id)
+
+            if not document:
+                handler.conclude_request(404, {}, smsg.DOCUMENT_NOT_FOUND)
+                return Result(code=404, target=document_id, username=handler.username)
+
+            latest_revision = fetch_latest_active_revisions_by_document(
+                session, [document.id]
+            ).get(document.id)
+            if latest_revision is None:
+                handler.conclude_request(
+                    404, {}, "No active revisions found for this document"
+                )
+                return Result(code=404, target=document_id, username=handler.username)
+
+            if not check_access_requirements(
+                session, user, document, access_type="read"
+            ):
+                handler.conclude_access_denial()
+                return Result(code=403, target=document_id, username=handler.username)
+
+            info_code = 0
+            access_rules = []
+            if Permissions.VIEW_ACCESS_RULES in user.all_permissions:
+                access_rules = get_access_rules_list(
+                    session,
+                    target_type="document",
+                    target_id=document.id,
+                )
+            else:
+                info_code = 1  # No permission to view document access rules.
+
+            data = {
+                "document_id": document.id,
+                "parent_id": document.folder_id,
+                "title": document.title,
+                "size": latest_revision.file.size,
+                "created_time": document.created_time,
+                "last_modified": latest_revision.created_time,
+                "access_rules": access_rules,
+                "info_code": info_code,
+            }
+
+            if Permissions.VIEW_METADATA in user.all_permissions:
+                data["metadata"] = serialize_document_metadata(document)
+
+            handler.conclude_request(200, data, "Document info retrieved successfully")
+            return Result(code=0, target=document_id, username=handler.username)
+
+
+class RequestGetDocumentAccessRulesHandler(RequestHandler):
+    request_model = _DocumentIDRequest
+    require_auth = True
+    rate_limit_cost = 2
+
+    def handle(self, handler: ConnectionHandler):
+
+        document_id: str = handler.data["document_id"]
+
+        with Session() as session:
+            user = User.get_existing(session, handler.username)
+            document = session.get(Document, document_id)
+
+            if not document:
+                handler.conclude_request(404, {}, smsg.DOCUMENT_NOT_FOUND)
+                return Result(code=404, target=document_id, username=handler.username)
+
+            if (
+                not check_access_requirements(
+                    session, user, document, access_type="read"
+                )
+                or Permissions.VIEW_ACCESS_RULES not in user.all_permissions
+            ):
+                handler.conclude_access_denial()
+                return Result(code=403, target=document_id, username=handler.username)
+
+            handler.conclude_request(
+                200,
+                {
+                    "rules": get_access_rules_dict(
+                        session,
+                        target_type="document",
+                        target_id=document.id,
+                    ),
+                    "inherit": document.inherit,
+                },
+                "Document access rules retrieved successfully",
+            )
+            return Result(code=0, target=document_id, username=handler.username)
+
+
+class RequestGetDocumentHandler(RequestHandler):
+    """Handles the "get_document" action."""
+
+    request_model = _DocumentIDRequest
+
+    require_auth = True
+    rate_limit_cost = 3
+
+    def handle(self, handler: ConnectionHandler):
+        document_id: str = handler.data["document_id"]
+
+        with Session() as session, risk_control_transaction(session):
+            user = User.get_existing(session, handler.username)
+            document = session.get(Document, document_id)
+
+            if not document:
+                response_code = result_code = 404
+                data = {}
+                message = smsg.DOCUMENT_NOT_FOUND
+            elif not check_access_requirements(session, user, document):
+                response_code = result_code = 403
+                data = {}
+                message = smsg.ACCESS_DENIED
+            else:
+                latest_revision = fetch_latest_active_revisions_by_document(
+                    session, [document.id]
+                ).get(document.id)
+                if latest_revision is None:
+                    response_code = 404
+                    result_code = 4041
+                    data = {}
+                    message = "No active revisions found for this document"
+                else:
+                    limit_decision = check_download_issue_limits(
+                        session,
+                        user.username,
+                        handler.remote_address,
+                        account_created_at=user.created_time,
+                        bypass_rate_limit=(
+                            Permissions.BYPASS_DOCUMENT_DOWNLOAD_RATE_LIMIT
+                            in user.all_permissions
+                        ),
+                    )
+                    if not limit_decision.allowed:
+                        response_code = result_code = 429
+                        data = {
+                            "scope": limit_decision.scope,
+                            "limit": limit_decision.limit,
+                            "retry_after_seconds": (limit_decision.retry_after_seconds),
+                        }
+                        message = (
+                            "Download request limit exceeded. Please try again later."
+                        )
+                    else:
+                        task_data = create_file_task(
+                            session,
+                            latest_revision.file,
+                            issued_by_username=user.username,
+                        )
+                        response_code = 200
+                        result_code = 0
+                        data = {
+                            "document_id": document.id,
+                            "title": document.title,
+                            "task_data": task_data,
+                        }
+                        message = "Document successfully fetched"
+
+        handler.conclude_request(response_code, data, message)
+        return Result(
+            code=result_code,
+            target=document_id,
+            data=data if result_code == 429 else None,
+            username=handler.username,
+        )
+
+
+class RequestCreateDocumentHandler(RequestHandler):
+    """Handles the "create_document" action."""
+
+    request_model = _CreateDocumentRequest
+
+    require_auth = True
+    rate_limit_cost = 5
+
+    def handle(self, handler: ConnectionHandler):
+        folder_id = handler.data.get("folder_id") or ROOT_DIRECTORY_ID
+        title = (handler.data.get("title") or "").strip()
+        access_rules = handler.data.get("access_rules") or {}
+        inherit_parent = handler.data.get("inherit_parent", True)
+
+        if not title:
+            handler.conclude_request(400, {}, smsg.DOCUMENT_TITLE_REQUIRED)
+            return
+
+        try_reclaim_abandoned_uploads(folder_id=folder_id, title=title)
+
+        conflict_response: tuple[dict, str] | None = None
+        with Session() as session:
+            try:
+                with risk_control_transaction(session):
+                    user = User.get_existing(session, handler.username)
+
+                    if Permissions.CREATE_DOCUMENT not in user.all_permissions:
+                        response_code = result_code = 403
+                        response_data = {}
+                        result_data = {"title": title}
+                        message = smsg.PERMISSION_DENIED
+                    else:
+                        _folder, err_code, err_msg = get_target_folder_and_check_write(
+                            session,
+                            user,
+                            folder_id,
+                            Permissions.SUPER_CREATE_DOCUMENT,
+                        )
+                        if err_code != 0:
+                            response_code = result_code = err_code
+                            response_data = {}
+                            result_data = {"title": title}
+                            message = err_msg
+                        else:
+                            limit_decision = check_document_creation_limits(
+                                session,
+                                user.username,
+                                handler.remote_address,
+                                account_created_at=user.created_time,
+                                bypass_rate_limit=(
+                                    Permissions.BYPASS_DOCUMENT_CREATION_RATE_LIMIT
+                                    in user.all_permissions
+                                ),
+                            )
+                            if not limit_decision.allowed:
+                                response_code = result_code = 429
+                                response_data = {
+                                    "scope": limit_decision.scope,
+                                    "limit": limit_decision.limit,
+                                    "retry_after_seconds": (
+                                        limit_decision.retry_after_seconds
+                                    ),
+                                }
+                                result_data = {"title": title, **response_data}
+                                message = (
+                                    "Document creation limit exceeded. "
+                                    "Please try again later."
+                                )
+                            else:
+                                today = datetime.datetime.now(datetime.UTC).date()
+                                file_id = secrets.token_hex(32)
+                                real_filename = secrets.token_hex(32)
+
+                                new_file = File(
+                                    id=file_id,
+                                    path=(
+                                        f"content/files/{today.year}/"
+                                        f"{today.month}/{real_filename}"
+                                    ),
+                                )
+                                new_document = Document(
+                                    id=secrets.token_hex(32),
+                                    title=title,
+                                    folder_id=folder_id,
+                                )
+                                new_document.metadata_record = DocumentMetadata(
+                                    creator_username=user.username,
+                                    last_modified_by_username=user.username,
+                                )
+                                new_revision = DocumentRevision(file_id=new_file.id)
+                                new_document.revisions.append(new_revision)
+                                session.add(new_file)
+                                session.add(new_document)
+                                session.add(new_revision)
+
+                                with node_name_mutation(session, folder_id, title):
+                                    if not apply_access_rules(
+                                        new_document,
+                                        access_rules,
+                                        user,
+                                        inherit_parent,
+                                    ):
+                                        session.rollback()
+                                        response_code = result_code = 403
+                                        response_data = {}
+                                        result_data = {"title": title}
+                                        message = smsg.ACCESS_DENIED
+                                    else:
+                                        new_document.current_revision = new_revision
+                                        task_data = create_file_task(
+                                            session,
+                                            new_file,
+                                            transfer_mode=TransferMode.UPLOAD,
+                                        )
+                                        response_code = 200
+                                        result_code = 0
+                                        response_data = {
+                                            "document_id": new_document.id,
+                                            "task_data": task_data,
+                                        }
+                                        result_data = {"title": title}
+                                        message = "Task successfully created"
+            except NodeNameConflictError:
+                conflict_response = describe_node_name_conflict(
+                    session, user, folder_id, title
+                )
+            except (ValueError, jsonschema.ValidationError) as exc:
+                response_code = result_code = 400
+                response_data = {}
+                result_data = {"title": title}
+                message = f"Set access rules failed: {exc!s}"
+
+        if conflict_response is not None:
+            payload, message = conflict_response
+            return respond_to_node_name_conflict(
+                handler,
+                payload,
+                message,
+                target=folder_id,
+                result_data={"title": title},
+            )
+
+        handler.conclude_request(response_code, response_data, message)
+        return Result(
+            code=result_code,
+            target=folder_id,
+            data=result_data,
+            username=handler.username,
+        )
+
+
+class RequestUploadDocumentHandler(RequestHandler):
+    """Handles the "upload_document" action."""
+
+    request_model = _UploadDocumentRequest
+
+    require_auth = True
+    rate_limit_cost = 5
+
+    def handle(self, handler: ConnectionHandler):
+        document_id = handler.data["document_id"]
+
+        try_reclaim_abandoned_uploads(document_id=document_id)
+
+        with Session() as session:
+            document = session.get(Document, document_id)
+            this_user = User.get_existing(session, handler.username)
+
+            if document:
+                if not check_access_requirements(
+                    session, this_user, document, access_type="write"
+                ):
+                    handler.conclude_access_denial()
+                    return Result(
+                        code=403, target=document_id, username=handler.username
+                    )
+
+                existing_task = (
+                    session.query(FileTask)
+                    .join(File, File.id == FileTask.file_id)
+                    .join(DocumentRevision, DocumentRevision.file_id == File.id)
+                    .filter(
+                        DocumentRevision.document_id == document_id,
+                        FileTask.mode == TransferMode.UPLOAD,
+                        FileTask.status.in_(
+                            (
+                                FileTaskStatus.PENDING,
+                                FileTaskStatus.IN_PROGRESS,
+                            )
+                        ),
+                    )
+                    .order_by(FileTask.start_time.desc())
+                    .first()
+                )
+                if existing_task is not None:
+                    status = expire_file_task_if_due(session, existing_task.id)
+                    if status == FileTaskStatus.EXPIRED:
+                        session.commit()
+                        handler.conclude_request(
+                            410,
+                            {"task_status": "expired"},
+                            "Existing upload task has expired",
+                        )
+                        return Result(
+                            code=410, target=document_id, username=handler.username
+                        )
+                    if status == FileTaskStatus.IN_PROGRESS:
+                        handler.conclude_request(
+                            409,
+                            {"task_status": "in_progress"},
+                            "Upload is already in progress",
+                        )
+                        return Result(
+                            code=409, target=document_id, username=handler.username
+                        )
+
+                    task_data = serialize_file_task(existing_task)
+                    handler.conclude_request(
+                        200,
+                        {"task_data": task_data},
+                        "Existing upload task returned",
+                    )
+                    return Result(
+                        code=0,
+                        target=document_id,
+                        data=task_data,
+                        username=handler.username,
+                    )
+
+                today = datetime.datetime.now(datetime.UTC).date()
+
+                file_id = secrets.token_hex(32)
+                real_filename = secrets.token_hex(32)
+
+                new_file = File(
+                    id=file_id,
+                    path=f"content/files/{today.year}/{today.month}/{real_filename}",
+                )
+
+                if "parent_revision_id" in handler.data:
+                    parent_revision_id = handler.data["parent_revision_id"]
+
+                    # Validate the provided parent_revision_id if it's not null
+                    if parent_revision_id and parent_revision_id not in [
+                        rev.id for rev in document.revisions
+                    ]:
+                        handler.conclude_request(
+                            400,
+                            {},
+                            "Parent revision does not exist or does not belong to this document",
+                        )
+                        return Result(
+                            code=400, target=document_id, username=handler.username
+                        )
+                else:
+                    try:
+                        parent_revision_id = document.get_latest_revision().id
+                    except NoActiveRevisionsError:
+                        parent_revision_id = None
+
+                new_revision = DocumentRevision(
+                    document_id=document_id,
+                    file_id=file_id,
+                    parent_revision_id=parent_revision_id,
+                )
+                session.add(new_file)
+                session.add(new_revision)
+
+                document.revisions.append(new_revision)
+                mark_document_modified(document, this_user.username)
+
+                document.current_revision = new_revision
+                task_data = create_file_task(session, new_file, TransferMode.UPLOAD)
+                session.commit()
+
+            else:
+                handler.conclude_request(404, {}, smsg.DOCUMENT_NOT_FOUND)
+                return Result(code=404, target=document_id, username=handler.username)
+
+        handler.conclude_request(
+            200, {"task_data": task_data}, "Task successfully created"
+        )
+        return Result(
+            code=0, target=document_id, data=task_data, username=handler.username
+        )
+
+
+class RequestDeleteDocumentHandler(RequestHandler):
+    """Handles the "delete_document" action."""
+
+    request_model = _DocumentIDRequest
+
+    require_auth = True
+    rate_limit_cost = 5
+
+    def handle(self, handler: ConnectionHandler):
+        document_id = handler.data["document_id"]
+        cancelled_task_ids: list[str] = []
+
+        with Session() as session:
+            user = User.get_existing(session, handler.username)
+            document = session.get(Document, document_id)
+
+            if not document:
+                handler.conclude_request(404, {}, smsg.DOCUMENT_NOT_FOUND)
+                return Result(code=404, target=document_id, username=handler.username)
+
+            if (
+                Permissions.DELETE_DOCUMENT not in user.all_permissions
+                or not check_access_requirements(
+                    session, user, document, access_type="write"
+                )
+            ):
+                handler.conclude_access_denial()
+                return Result(code=403, target=document_id, username=handler.username)
+
+            document.status = EntityStatus.DELETED
+            document.status_operation_id = (
+                f"OP_DEL_{secrets.token_hex(8)}_{int(time.time())}"
+            )
+            unreachable_file_ids = find_unreachable_document_file_ids(
+                session, [document_id]
+            )
+            cancelled_task_ids = cancel_file_tasks_for_files(
+                session, unreachable_file_ids
+            )
+            mark_document_modified(document, user.username)
+            session.commit()
+
+        publish_cancelled_file_tasks(cancelled_task_ids)
+
+        handler.conclude_request(200, {}, "Document successfully deleted")
+        return Result(code=0, target=document_id, username=handler.username)
+
+
+class RequestRenameDocumentHandler(RequestHandler):
+    """Handles the "rename_document" action."""
+
+    request_model = _RenameDocumentRequest
+
+    require_auth = True
+    rate_limit_cost = 3
+
+    def handle(self, handler: ConnectionHandler):
+
+        # Parse the directory renaming request
+        document_id: str = handler.data["document_id"]
+        new_title: str = handler.data["new_title"]
+
+        with Session() as session:
+            this_user = User.get_existing(session, handler.username)
+            document = session.get(Document, document_id)
+
+            if not document:
+                handler.conclude_request(404, {}, smsg.DOCUMENT_NOT_FOUND)
+                return Result(code=404, target=document_id, username=handler.username)
+
+            if (
+                Permissions.RENAME_DOCUMENT not in this_user.all_permissions
+                or not check_access_requirements(session, this_user, document, "write")
+            ):
+                handler.conclude_access_denial()
+                return Result(code=403, target=document_id, username=handler.username)
+
+            if document.title == new_title:
+                handler.conclude_request(
+                    code=400,
+                    message="New name is the same as the current name",
+                    data={},
+                )
+                return
+
+            parent_id = document.folder_id or ROOT_DIRECTORY_ID
+            old_title = document.title
+            try:
+                with node_name_mutation(session, parent_id, new_title):
+                    document.title = new_title
+                    mark_document_modified(document, this_user.username)
+                    session.commit()
+            except NodeNameConflictError:
+                payload, message = describe_node_name_conflict(
+                    session, this_user, parent_id, new_title
+                )
+                return respond_to_node_name_conflict(
+                    handler,
+                    payload,
+                    message,
+                    target=parent_id,
+                    result_data={"title": old_title},
+                )
+
+            handler.conclude_request(
+                code=200, message="Document renamed successfully", data={}
+            )
+            return Result(code=0, target=document_id, username=handler.username)
+
+
+class RequestDownloadFileHandler(RequestHandler):
+    """Handles the "download_file" action."""
+
+    request_model = _DownloadFileRequest
+    rate_limit_cost = 5
+
+    def handle(self, handler: ConnectionHandler):
+        if not global_config.get("transfer", {}).get("legacy_websocket_enabled", True):
+            handler.conclude_request(410, {}, "Legacy WebSocket transfer is disabled; use prepare_download")
+            return
+        task_id: str = handler.data["task_id"]
+        offset: int = handler.data.get("offset", 0)
+        max_chunk_size: int = handler.data["max_chunk_size"]
+
+        # The server still needs to send one more response.
+        handler.send_file(task_id, offset, max_chunk_size)
+
+
+class RequestUploadFileHandler(RequestHandler):
+    """Handles the "upload_file" action."""
+
+    request_model = _UploadFileRequest
+    rate_limit_cost = 5
+
+    def handle(self, handler: ConnectionHandler):
+        if not global_config.get("transfer", {}).get("legacy_websocket_enabled", True):
+            handler.conclude_request(410, {}, "Legacy WebSocket transfer is disabled; use prepare_upload")
+            return
+        task_id = handler.data["task_id"]
+        file_size = handler.data["file_size"]
+        sha256 = handler.data["sha256"]
+        max_chunk_size = handler.data["max_chunk_size"]
+        restart = handler.data.get("restart", False)
+
+        # The server needs to send one response.
+        handler.receive_file(
+            task_id,
+            file_size,
+            sha256.lower() if sha256 is not None else None,
+            max_chunk_size,
+            restart,
+        )
+
+
+class RequestSetDocumentRulesHandler(RequestHandler):
+    """Handles the "set_document_rules" action."""
+
+    request_model = _SetDocumentRulesRequest
+
+    require_auth = True
+    rate_limit_cost = 5
+
+    def handle(self, handler: ConnectionHandler):
+        """Handles the document access rules setting request from the client."""
+        document_id: str = handler.data["document_id"]
+        access_rules_to_apply: dict = handler.data["access_rules"]
+        inherit_parent: bool = handler.data.get("inherit_parent", True)
+
+        if not handler.username:
+            handler.conclude_request(401, {}, smsg.AUTHENTICATION_REQUIRED)
+            return Result(code=401, target=document_id)
+
+        with Session() as session:
+            user = User.get_existing(session, handler.username)
+
+            document = session.get(Document, document_id)
+
+            if not document:
+                handler.conclude_request(404, {}, smsg.DOCUMENT_NOT_FOUND)
+                return Result(code=404, target=document_id, username=handler.username)
+
+            if Permissions.SET_ACCESS_RULES not in user.all_permissions:
+                handler.conclude_request(403, {}, smsg.ACCESS_DENIED_SET_ACCESS_RULES)
+                return Result(code=403, target=document_id, username=handler.username)
+
+            if not check_access_requirements(
+                session, user, document, access_type="manage"
+            ):
+                handler.conclude_access_denial()
+                return Result(code=403, target=document_id, username=handler.username)
+
+            try:
+                if apply_access_rules(
+                    document, access_rules_to_apply, user, inherit_parent
+                ):
+                    mark_document_modified(document, user.username)
+                    session.commit()
+                    handler.conclude_request(200, {}, "Set access rules successfully")
+                    return Result(code=0, target=document_id, username=handler.username)
+                else:
+                    session.rollback()
+                    handler.conclude_access_denial()
+                    return Result(
+                        code=403, target=document_id, username=handler.username
+                    )
+            except (ValueError, jsonschema.ValidationError) as exc:
+                session.rollback()
+                handler.conclude_request(400, {}, f"Set access rules failed: {exc!s}")
+                return Result(code=400, target=document_id, username=handler.username)
+
+
+class RequestMoveDocumentHandler(RequestHandler):
+    """Handles the "move_document" action."""
+
+    request_model = _MoveDocumentRequest
+
+    require_auth = True
+    rate_limit_cost = 3
+
+    def handle(self, handler: ConnectionHandler):
+
+        document_id: str = handler.data["document_id"]
+        target_folder_id: str | None = handler.data.get("target_folder_id")
+
+        if not target_folder_id:
+            target_folder_id = ROOT_DIRECTORY_ID
+
+        with Session() as session:
+            user = User.get_existing(session, handler.username)
+
+            if Permissions.MOVE not in user.all_permissions:
+                handler.conclude_request(403, {}, smsg.ACCESS_DENIED_MOVE_DOCUMENT)
+                return Result(
+                    code=403,
+                    target=document_id,
+                    data={"target_folder_id": target_folder_id},
+                    username=handler.username,
+                )
+
+            document = session.get(Document, document_id)
+            if not document:
+                handler.conclude_request(
+                    code=404, message=smsg.TARGET_DOCUMENT_NOT_FOUND, data={}
+                )
+                return Result(
+                    code=404,
+                    target=document_id,
+                    data={"target_folder_id": target_folder_id},
+                    username=handler.username,
+                )
+
+            if document.folder_id == target_folder_id:
+                handler.conclude_request(400, {}, smsg.CANNOT_MOVE_TO_SAME_FOLDER)
+                return Result(
+                    code=400,
+                    target=document_id,
+                    data={"target_folder_id": target_folder_id},
+                    username=handler.username,
+                )
+
+            if not check_access_requirements(session, user, document, "move"):
+                handler.conclude_request(403, {}, smsg.ACCESS_DENIED_MOVE_DOCUMENT)
+                return Result(
+                    code=403,
+                    target=document_id,
+                    data={"target_folder_id": target_folder_id},
+                    username=handler.username,
+                )
+
+            target_folder = session.get(Folder, target_folder_id)
+            if not target_folder:
+                handler.conclude_request(
+                    code=404, message=smsg.TARGET_DIRECTORY_NOT_FOUND, data={}
+                )
+                return Result(
+                    code=404,
+                    target=document_id,
+                    data={"target_folder_id": target_folder_id},
+                    username=handler.username,
+                )
+
+            if not check_access_requirements(session, user, target_folder, "write"):
+                if (
+                    target_folder_id == ROOT_DIRECTORY_ID
+                    and Permissions.SUPER_CREATE_DOCUMENT in user.all_permissions
+                ):
+                    pass
+                else:
+                    handler.conclude_request(
+                        403, {}, smsg.ACCESS_DENIED_WRITE_DIRECTORY
+                    )
+                    return Result(
+                        code=403,
+                        target=document_id,
+                        data={"target_folder_id": target_folder_id},
+                        username=handler.username,
+                    )
+
+            source_folder_id = document.folder_id or ROOT_DIRECTORY_ID
+            title = document.title
+            try:
+                with node_name_mutation(session, target_folder_id, title):
+                    document.folder = target_folder
+                    mark_document_modified(document, user.username)
+                    session.commit()
+            except NodeNameConflictError:
+                payload, message = describe_node_name_conflict(
+                    session, user, target_folder_id, title
+                )
+                return respond_to_node_name_conflict(
+                    handler,
+                    payload,
+                    message,
+                    target=source_folder_id,
+                    result_data={"title": title},
+                )
+
+        handler.conclude_request(200, {}, smsg.SUCCESS)
+        return Result(
+            code=0,
+            target=document_id,
+            data={"target_folder_id": target_folder_id},
+            username=handler.username,
+        )
+
+
+class RequestPurgeDocumentHandler(RequestHandler):
+    """Handles the "purge_document" action, which permanently deletes a document and all its revisions.
+
+    This action is irreversible and should only be allowed for users with special permissions.
+    """
+
+    request_model = _DocumentIDRequest
+
+    require_auth = True
+    rate_limit_cost = 10
+
+    def handle(self, handler: ConnectionHandler):
+        doc_id = handler.data["document_id"]
+        with Session() as session:
+            user = User.get_existing(session, handler.username)
+
+            if Permissions.PURGE not in user.all_permissions:
+                handler.conclude_permission_denial()
+                return
+
+            document = session.get(
+                Document, doc_id, execution_options={"include_deleted": True}
+            )
+            if document is None:
+                handler.conclude_request(404, {}, smsg.DOCUMENT_NOT_FOUND)
+                return
+
+            if document.status != EntityStatus.DELETED:
+                handler.conclude_request(
+                    400, {}, "Document must be marked as deleted before purging"
+                )
+                return
+
+            if not check_access_requirements(session, user, document, "write"):
+                handler.conclude_access_denial()
+                return
+
+            delete_all_document_revisions(session, document)
+            mark_document_modified(document, user.username)
+            session.delete(document)
+            session.commit()
+
+        handler.conclude_request(200, {}, "Document permanently deleted")
+        return Result(code=0, target=doc_id, username=handler.username)
+
+
+class RequestRestoreDocumentHandler(RequestHandler):
+    """Handles the "restore_document" action.
+    Restores a marked-as-deleted document. Supports renaming and moving to a
+    new folder during restoration. Maps virtual ROOT_DIRECTORY_ID to database None.
+    """
+
+    request_model = _RestoreDocumentRequest
+
+    require_auth = True
+    rate_limit_cost = 3
+
+    def handle(self, handler: ConnectionHandler):
+        doc_id = handler.data["document_id"]
+
+        target_folder_provided = "target_folder_id" in handler.data
+        target_folder_id: str | None = handler.data.get("target_folder_id")
+        new_title = handler.data.get("new_title")
+
+        with Session() as session:
+            user = User.get_existing(session, handler.username)
+
+            if Permissions.RESTORE not in user.all_permissions:
+                handler.conclude_permission_denial()
+                return Result(code=403, target=doc_id, username=handler.username)
+
+            document = session.get(
+                Document, doc_id, execution_options={"include_deleted": True}
+            )
+
+            if not document or document.status != EntityStatus.DELETED:
+                handler.conclude_request(404, {}, smsg.DELETED_DOCUMENT_NOT_FOUND)
+                return Result(code=404, target=doc_id, username=handler.username)
+
+            if not check_access_requirements(session, user, document, "write"):
+                handler.conclude_access_denial()
+                return Result(code=403, target=doc_id, username=handler.username)
+
+            if target_folder_provided:
+                db_folder_id = target_folder_id or ROOT_DIRECTORY_ID
+            else:
+                db_folder_id = document.folder_id or ROOT_DIRECTORY_ID
+
+            final_title = new_title if new_title else document.title
+
+            target_folder = session.get(
+                Folder, db_folder_id, execution_options={"include_deleted": True}
+            )
+            if not target_folder:
+                handler.conclude_request(404, {}, smsg.TARGET_DIRECTORY_NOT_FOUND)
+                return Result(code=404, target=db_folder_id, username=handler.username)
+
+            if not check_access_requirements(session, user, target_folder, "write"):
+                handler.conclude_access_denial()
+                return Result(code=403, target=db_folder_id, username=handler.username)
+
+            if target_folder.status != EntityStatus.OK:
+                handler.conclude_request(
+                    409,
+                    {"folder_id": db_folder_id},
+                    "Cannot restore: Target folder is deleted. Restore it first.",
+                )
+                return Result(code=409, target=doc_id, username=handler.username)
+
+            try:
+                with node_name_mutation(session, db_folder_id, final_title):
+                    document.status = EntityStatus.OK
+                    document.status_operation_id = None
+                    document.title = final_title
+                    document.folder_id = db_folder_id
+                    mark_document_modified(document, user.username)
+                    session.commit()
+            except NodeNameConflictError:
+                payload, message = describe_node_name_conflict(
+                    session, user, db_folder_id, final_title
+                )
+                return respond_to_node_name_conflict(
+                    handler,
+                    payload,
+                    message,
+                    target=doc_id,
+                    result_data={},
+                )
+
+            handler.conclude_request(
+                200,
+                {
+                    "title": final_title,
+                    "folder_id": db_folder_id,
+                },
+                "Document successfully restored",
+            )
+            return Result(code=0, target=doc_id, username=handler.username)
+
+
+class RequestSetDocumentTagsHandler(RequestHandler):
+    request_model = _SetDocumentTagsRequest
+
+    require_auth = True
+    rate_limit_cost = 3
+
+    def handle(self, handler: ConnectionHandler):
+        document_id: str = handler.data["document_id"]
+
+        normalized_tags = []
+        seen_tags = set()
+        for raw_tag in handler.data["tags"]:
+            tag = raw_tag.strip()
+            if not tag:
+                handler.conclude_request(400, {}, "Tags cannot be blank")
+                return Result(code=400, target=document_id, username=handler.username)
+            if tag not in seen_tags:
+                normalized_tags.append(tag)
+                seen_tags.add(tag)
+
+        with Session() as session:
+            user = User.get_existing(session, handler.username)
+            document = session.get(Document, document_id)
+
+            if not document:
+                handler.conclude_request(404, {}, smsg.DOCUMENT_NOT_FOUND)
+                return Result(code=404, target=document_id, username=handler.username)
+
+            if (
+                Permissions.SET_METADATA_TAGS not in user.all_permissions
+                or not check_access_requirements(
+                    session, user, document, access_type="write"
+                )
+            ):
+                handler.conclude_access_denial()
+                return Result(code=403, target=document_id, username=handler.username)
+
+            metadata = get_or_create_document_metadata(document)
+            existing_by_tag = {
+                tag_record.tag: tag_record for tag_record in metadata.tags
+            }
+            requested_tag_set = set(normalized_tags)
+
+            for tag_record in list(metadata.tags):
+                if tag_record.tag not in requested_tag_set:
+                    metadata.tags.remove(tag_record)
+
+            for position, tag in enumerate(normalized_tags):
+                if tag in existing_by_tag:
+                    existing_by_tag[tag].position = position
+                else:
+                    metadata.tags.append(
+                        DocumentMetadataTag(tag=tag, position=position)
+                    )
+
+            metadata.last_modified_by_username = user.username
+            session.commit()
+
+            handler.conclude_request(
+                200,
+                {"tags": normalized_tags},
+                "Document metadata tags updated successfully",
+            )
+            return Result(
+                code=0,
+                target=document_id,
+                data={"tags": normalized_tags},
+                username=handler.username,
+            )

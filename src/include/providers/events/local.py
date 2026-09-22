@@ -1,7 +1,7 @@
 __all__ = ["LocalEventBusProvider"]
 
 import threading
-from typing import Callable
+from collections.abc import Callable
 
 from loguru import logger
 
@@ -26,5 +26,5 @@ class LocalEventBusProvider(EventBusProvider):
         for callback in subs:
             try:
                 callback(message)
-            except Exception as e:
+            except Exception as e:  # noqa: BLE001 - callbacks are third-party code.
                 logger.error(f"Error in pubsub callback: {e}")
